@@ -160,6 +160,39 @@ fn disable_zswap_for_zram() {
 }
 
 
+/// Configure MGLRU anti-thrashing protection
+/// Sets min_ttl_ms which protects the working set from premature eviction
+fn configure_mglru(config: &Config, recommended: Option<&RecommendedConfig>) {
+    const MGLRU_MIN_TTL_PATH: &str = "/sys/kernel/mm/lru_gen/min_ttl_ms";
+
+    // Check if MGLRU is available
+    if !Path::new(MGLRU_MIN_TTL_PATH).exists() {
+        return;
+    }
+
+    // Get configured value, or use recommended value from autoconfig
+    let min_ttl_ms: u32 = config
+        .get_opt("mglru_min_ttl_ms")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_else(|| {
+            recommended
+                .map(|r| r.mglru_min_ttl_ms)
+                .unwrap_or(defaults::MGLRU_MIN_TTL_MS)
+        });
+
+    if min_ttl_ms == 0 {
+        return;
+    }
+
+    // Apply the setting
+    match fs::write(MGLRU_MIN_TTL_PATH, min_ttl_ms.to_string()) {
+        Ok(_) => info!(
+            "MGLRU: min_ttl_ms = {} (working set protection)",
+            min_ttl_ms
+        ),
+        Err(e) => warn!("MGLRU: failed to set min_ttl_ms: {}", e),
+    }
+}
 
 /// Start the swap daemon
 fn start() -> Result<(), Box<dyn std::error::Error>> {
@@ -207,6 +240,9 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(swap_mode, SwapMode::Auto) {
         config.apply_autoconfig(&recommended);
     }
+
+    // Configure MGLRU early (protects working set during swap operations)
+    configure_mglru(&config, Some(&recommended));
 
     // Determine effective mode
     let effective_mode = match swap_mode {

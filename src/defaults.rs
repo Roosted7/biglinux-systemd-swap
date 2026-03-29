@@ -40,3 +40,7 @@ pub const SWAPFILE_FREQUENCY: u32 = 1;
 pub const SWAPFILE_SHRINK_THRESHOLD: u8 = 30;
 pub const SWAPFILE_SAFE_HEADROOM: u8 = 40;
 pub const SWAPFILE_NOCOW: &str = "1";
+
+// ── MGLRU (Multi-Gen LRU) ──────────────────────────────────────────────────
+
+pub const MGLRU_MIN_TTL_MS: u32 = 1000;

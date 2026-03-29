@@ -92,6 +92,9 @@ pub struct RecommendedConfig {
     pub swapfc_free_ram_perc: u8,
     pub swapfc_free_swap_perc: u8,
     pub swapfc_remove_free_swap_perc: u8,
+
+    // MGLRU settings
+    pub mglru_min_ttl_ms: u32,
 }
 
 impl Default for RecommendedConfig {
@@ -112,6 +115,7 @@ impl RecommendedConfig {
             swapfc_free_ram_perc: defaults::SWAPFILE_FREE_RAM_PERC,
             swapfc_free_swap_perc: defaults::SWAPFILE_FREE_SWAP_PERC,
             swapfc_remove_free_swap_perc: defaults::SWAPFILE_REMOVE_FREE_SWAP_PERC,
+            mglru_min_ttl_ms: defaults::MGLRU_MIN_TTL_MS,
         }
     }
 
@@ -129,6 +133,7 @@ impl RecommendedConfig {
             swapfc_free_ram_perc: defaults::SWAPFILE_FREE_RAM_PERC,
             swapfc_free_swap_perc: defaults::SWAPFILE_FREE_SWAP_PERC,
             swapfc_remove_free_swap_perc: defaults::SWAPFILE_REMOVE_FREE_SWAP_PERC,
+            mglru_min_ttl_ms: defaults::MGLRU_MIN_TTL_MS,
         }
     }
 
@@ -159,6 +164,9 @@ impl RecommendedConfig {
                 ("swapfile_remove_free_swap_perc", self.swapfc_remove_free_swap_perc.to_string()),
             ]);
         }
+
+        // MGLRU: always inject so auto mode configures it
+        pairs.push(("mglru_min_ttl_ms", self.mglru_min_ttl_ms.to_string()));
 
         pairs
     }
