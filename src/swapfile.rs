@@ -1525,3 +1525,207 @@ fn is_btrfs_subvolume(path: &Path) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── SwapFileInfo ─────────────────────────────────────────────────────────
+
+    fn info(size: u64, used: u64) -> SwapFileInfo {
+        SwapFileInfo {
+            path: PathBuf::from("/swapfile/1"),
+            size_bytes: size,
+            used_bytes: used,
+            priority: 0,
+        }
+    }
+
+    #[test]
+    fn usage_percent_zero_size_is_zero() {
+        assert_eq!(info(0, 0).usage_percent(), 0);
+    }
+
+    #[test]
+    fn usage_percent_half_full() {
+        assert_eq!(info(1000, 500).usage_percent(), 50);
+    }
+
+    #[test]
+    fn usage_percent_full() {
+        assert_eq!(info(1000, 1000).usage_percent(), 100);
+    }
+
+    #[test]
+    fn is_nearly_empty_true_below_threshold() {
+        assert!(info(1000, 100).is_nearly_empty(30));
+    }
+
+    #[test]
+    fn is_nearly_empty_equal_threshold_true() {
+        // Uses <= for boundary
+        assert!(info(1000, 300).is_nearly_empty(30));
+    }
+
+    #[test]
+    fn is_nearly_empty_false_above_threshold() {
+        assert!(!info(1000, 500).is_nearly_empty(30));
+    }
+
+    // ── validate_swapfile_path ───────────────────────────────────────────────
+
+    #[test]
+    fn validate_rejects_relative_path() {
+        assert!(!validate_swapfile_path(Path::new("relative/path")));
+        assert!(!validate_swapfile_path(Path::new("swapfile")));
+    }
+
+    #[test]
+    fn validate_rejects_forbidden_system_dirs() {
+        for p in &[
+            "/etc", "/etc/swap", "/sys", "/proc", "/dev", "/run", "/bin",
+            "/sbin", "/usr", "/lib", "/lib64", "/boot", "/snap", "/lost+found",
+            "/usr/local/swap", "/boot/swap",
+        ] {
+            assert!(
+                !validate_swapfile_path(Path::new(p)),
+                "{} should be rejected",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_normal_swap_paths() {
+        for p in &[
+            "/swapfile",
+            "/swap",
+            "/var/swapfile",
+            "/home/swap",
+            "/mnt/swap",
+            "/tmp/swap",
+        ] {
+            assert!(
+                validate_swapfile_path(Path::new(p)),
+                "{} should be accepted",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_prefix_only_when_full_component() {
+        // "/etcd" must NOT be rejected even though it starts with "/etc".
+        // The validator checks "/etc/" (with trailing slash) or exact "/etc".
+        assert!(validate_swapfile_path(Path::new("/etcd")));
+        assert!(validate_swapfile_path(Path::new("/developer")));
+    }
+
+    // ── SwapFileConfig::from_config ──────────────────────────────────────────
+
+    fn cfg(pairs: &[(&str, &str)]) -> crate::config::Config {
+        crate::config::Config::from_pairs_for_tests(pairs.iter().map(|(k, v)| (*k, *v)))
+    }
+
+    #[test]
+    fn from_config_rejects_invalid_path() {
+        let c = cfg(&[("swapfile_path", "/etc")]);
+        assert!(matches!(
+            SwapFileConfig::from_config(&c),
+            Err(SwapFileError::InvalidPath)
+        ));
+    }
+
+    #[test]
+    fn from_config_clamps_max_count_to_28() {
+        let c = cfg(&[("swapfile_max_count", "99")]);
+        let sc = SwapFileConfig::from_config(&c).unwrap();
+        assert_eq!(sc.max_count, 28);
+    }
+
+    #[test]
+    fn from_config_clamps_max_count_min_1() {
+        let c = cfg(&[("swapfile_max_count", "0")]);
+        let sc = SwapFileConfig::from_config(&c).unwrap();
+        assert_eq!(sc.max_count, 1);
+    }
+
+    #[test]
+    fn from_config_clamps_shrink_threshold_10_50() {
+        let c = cfg(&[("swapfile_shrink_threshold", "5")]);
+        assert_eq!(SwapFileConfig::from_config(&c).unwrap().shrink_threshold, 10);
+
+        let c = cfg(&[("swapfile_shrink_threshold", "99")]);
+        assert_eq!(SwapFileConfig::from_config(&c).unwrap().shrink_threshold, 50);
+    }
+
+    #[test]
+    fn from_config_clamps_safe_headroom_20_60() {
+        let c = cfg(&[("swapfile_safe_headroom", "5")]);
+        assert_eq!(SwapFileConfig::from_config(&c).unwrap().safe_headroom, 20);
+
+        let c = cfg(&[("swapfile_safe_headroom", "99")]);
+        assert_eq!(SwapFileConfig::from_config(&c).unwrap().safe_headroom, 60);
+    }
+
+    #[test]
+    fn from_config_clamps_frequency_1_86400() {
+        let c = cfg(&[("swapfile_frequency", "0")]);
+        assert_eq!(SwapFileConfig::from_config(&c).unwrap().frequency, 1);
+    }
+
+    #[test]
+    fn from_config_enforces_min_chunk_non_sparse() {
+        // non-sparse: min chunk is 512MiB
+        let c = cfg(&[("swapfile_chunk_size", "64M")]);
+        let sc = SwapFileConfig::from_config(&c).unwrap();
+        assert_eq!(sc.chunk_size, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn from_config_enforces_min_chunk_sparse() {
+        // sparse: min chunk is 128MiB
+        let c = cfg(&[
+            ("swapfile_chunk_size", "64M"),
+            ("swapfile_sparse_loop", "1"),
+        ]);
+        let sc = SwapFileConfig::from_config(&c).unwrap();
+        assert_eq!(sc.chunk_size, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn from_config_nocow_defaults_true() {
+        let c = cfg(&[]);
+        assert!(SwapFileConfig::from_config(&c).unwrap().nocow);
+    }
+
+    #[test]
+    fn from_config_nocow_false_variants() {
+        for v in &["0", "false", "no", "off"] {
+            let c = cfg(&[("swapfile_nocow", *v)]);
+            assert!(!SwapFileConfig::from_config(&c).unwrap().nocow);
+        }
+    }
+
+    #[test]
+    fn from_config_trailing_slash_stripped() {
+        let c = cfg(&[("swapfile_path", "/swap/")]);
+        let sc = SwapFileConfig::from_config(&c).unwrap();
+        assert_eq!(sc.path, PathBuf::from("/swap"));
+    }
+
+    #[test]
+    fn from_config_growth_chunk_size_empty_is_zero() {
+        let c = cfg(&[]);
+        assert_eq!(SwapFileConfig::from_config(&c).unwrap().growth_chunk_size, 0);
+    }
+
+    #[test]
+    fn from_config_growth_chunk_size_parsed() {
+        let c = cfg(&[("swapfile_growth_chunk_size", "1G")]);
+        assert_eq!(
+            SwapFileConfig::from_config(&c).unwrap().growth_chunk_size,
+            1024 * 1024 * 1024
+        );
+    }
+}

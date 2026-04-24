@@ -1079,3 +1079,134 @@ fn get_device_stats(sysfs_path: &str, disksize: u64) -> Option<ZramStats> {
         pages_compacted: fields.get(6).copied().unwrap_or(0),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(orig: u64, compr: u64, disk: u64) -> ZramStats {
+        ZramStats {
+            orig_data_size: orig,
+            compr_data_size: compr,
+            mem_used_total: compr,
+            mem_limit: 0,
+            disksize: disk,
+            same_pages: 0,
+            pages_compacted: 0,
+        }
+    }
+
+    // ── ZramStats::compression_ratio ─────────────────────────────────────────
+
+    #[test]
+    fn compression_ratio_zero_compr_returns_zero() {
+        assert_eq!(stats(100, 0, 0).compression_ratio(), 0.0);
+    }
+
+    #[test]
+    fn compression_ratio_4x() {
+        let r = stats(400, 100, 0).compression_ratio();
+        assert!((r - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compression_ratio_1x_equal_data() {
+        let r = stats(100, 100, 0).compression_ratio();
+        assert!((r - 1.0).abs() < 1e-9);
+    }
+
+    // ── ZramStats::memory_utilization ────────────────────────────────────────
+
+    #[test]
+    fn memory_utilization_zero_disksize() {
+        assert_eq!(stats(0, 0, 0).memory_utilization(), 0);
+    }
+
+    #[test]
+    fn memory_utilization_half() {
+        assert_eq!(stats(500, 100, 1000).memory_utilization(), 50);
+    }
+
+    #[test]
+    fn memory_utilization_full() {
+        assert_eq!(stats(1000, 200, 1000).memory_utilization(), 100);
+    }
+
+    // ── ZramPoolConfig::from_config clamps ───────────────────────────────────
+
+    fn cfg_from(pairs: &[(&str, &str)]) -> Config {
+        Config::from_pairs_for_tests(pairs.iter().map(|(k, v)| (*k, *v)))
+    }
+
+    #[test]
+    fn pool_config_max_devices_clamps_to_1_8() {
+        let cfg = cfg_from(&[("zram_max_devices", "99")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).max_devices, 8);
+
+        let cfg = cfg_from(&[("zram_max_devices", "0")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).max_devices, 1);
+    }
+
+    #[test]
+    fn pool_config_expand_threshold_clamps_to_50_95() {
+        let cfg = cfg_from(&[("zram_expand_threshold", "10")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).expand_threshold, 50);
+
+        let cfg = cfg_from(&[("zram_expand_threshold", "200")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).expand_threshold, 95);
+    }
+
+    #[test]
+    fn pool_config_contract_threshold_clamps_to_5_50() {
+        let cfg = cfg_from(&[("zram_contract_threshold", "1")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).contract_threshold, 5);
+
+        let cfg = cfg_from(&[("zram_contract_threshold", "90")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).contract_threshold, 50);
+    }
+
+    #[test]
+    fn pool_config_expand_min_ratio_clamps_to_1_5_5_0() {
+        let cfg = cfg_from(&[("zram_expand_min_ratio", "1.0")]);
+        let ratio = ZramPoolConfig::from_config(&cfg).expand_min_ratio;
+        assert!((ratio - 1.5).abs() < 1e-9);
+
+        let cfg = cfg_from(&[("zram_expand_min_ratio", "10.0")]);
+        let ratio = ZramPoolConfig::from_config(&cfg).expand_min_ratio;
+        assert!((ratio - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pool_config_defaults_when_unset() {
+        let cfg = cfg_from(&[]);
+        let pc = ZramPoolConfig::from_config(&cfg);
+        assert_eq!(pc.max_devices, defaults::ZRAM_MAX_DEVICES);
+        assert_eq!(pc.algorithm, defaults::ZRAM_ALG);
+        assert_eq!(pc.priority, defaults::ZRAM_PRIO);
+    }
+
+    #[test]
+    fn pool_config_initial_size_percent_raw() {
+        // from_config alone reports raw value; ZramPool::new enforces >=50.
+        let cfg = cfg_from(&[("zram_size", "10%")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).initial_size_percent, 10);
+    }
+
+    #[test]
+    fn pool_config_mem_limit_percent_from_percent_string() {
+        let cfg = cfg_from(&[("zram_mem_limit", "40%")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).mem_limit_percent, 40);
+    }
+
+    #[test]
+    fn pool_config_mem_limit_non_percent_ignored() {
+        let cfg = cfg_from(&[("zram_mem_limit", "512M")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).mem_limit_percent, 0);
+    }
+
+    #[test]
+    fn pool_config_custom_algorithm() {
+        let cfg = cfg_from(&[("zram_alg", "lz4")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).algorithm, "lz4");
+    }
+}

@@ -18,6 +18,9 @@ thiserror = "2"
 pathdiff = "0.2"
 ctrlc = "3"
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 opt-level = "z"
 lto = true

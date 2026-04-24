@@ -288,4 +288,42 @@ mod tests {
         // This test may not work without swap, but should not panic
         let _ = get_effective_swap_usage();
     }
+
+    #[test]
+    fn page_size_is_positive_power_of_two() {
+        let p = get_page_size();
+        assert!(p > 0);
+        assert!(p.is_power_of_two());
+    }
+
+    #[test]
+    fn cpu_count_at_least_one() {
+        assert!(get_cpu_count() >= 1);
+    }
+
+    #[test]
+    fn free_swap_percent_bounded() {
+        if let Ok(pct) = get_free_swap_percent() {
+            assert!(pct <= 100);
+        }
+    }
+
+    #[test]
+    fn free_swap_percent_effective_bounded() {
+        if let Ok(pct) = get_free_swap_percent_effective() {
+            assert!(pct <= 100);
+        }
+    }
+
+    #[test]
+    fn get_mem_stats_missing_field_errors() {
+        let res = get_mem_stats(&["NonexistentField_XYZ"]);
+        assert!(matches!(res, Err(MemInfoError::MissingField(_))));
+    }
+
+    #[test]
+    fn get_mem_stats_reads_known_field() {
+        let stats = get_mem_stats(&["MemTotal"]).unwrap();
+        assert!(stats["MemTotal"] > 0);
+    }
 }

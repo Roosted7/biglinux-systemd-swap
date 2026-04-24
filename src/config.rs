@@ -281,6 +281,32 @@ impl Config {
     pub fn get_opt(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(|s| s.as_str())
     }
+
+    /// Test-only constructor: parse a single config file, no system sources.
+    ///
+    /// Exposed publicly so integration tests (a separate crate) can use it,
+    /// but hidden from rustdoc: not part of the stable API.
+    #[doc(hidden)]
+    pub fn from_file_for_tests<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let system_vars = HashMap::new();
+        let values = Self::parse_config(path, &system_vars)?;
+        Ok(Self { values })
+    }
+
+    /// Test-only constructor: build from a set of key-value pairs.
+    #[doc(hidden)]
+    pub fn from_pairs_for_tests<I, K, V>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let values = pairs
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        Self { values }
+    }
 }
 
 #[cfg(test)]

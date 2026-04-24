@@ -200,3 +200,34 @@ pub fn swapoff(device: &str) -> Result<()> {
         )))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemctl_action_as_str_matches_cli() {
+        assert_eq!(SystemctlAction::Start.as_str(), "start");
+        assert_eq!(SystemctlAction::Stop.as_str(), "stop");
+        assert_eq!(SystemctlAction::DaemonReload.as_str(), "daemon-reload");
+    }
+
+    #[test]
+    fn device_type_display_matches_unit_file_grammar() {
+        assert_eq!(DeviceType::File.to_string(), "File");
+        assert_eq!(DeviceType::Block.to_string(), "Block/Partition");
+    }
+
+    #[test]
+    fn swapoff_rejects_nul_byte_in_path() {
+        let res = swapoff("/path/with\0nul");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn swapoff_nonexistent_device_errors() {
+        // Unprivileged invocation: must not panic; returns an error.
+        let res = swapoff("/nonexistent/device/xyz");
+        assert!(res.is_err());
+    }
+}

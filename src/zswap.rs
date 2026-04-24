@@ -292,3 +292,93 @@ impl ZswapStatus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_status() -> ZswapStatus {
+        ZswapStatus {
+            enabled: true,
+            compressor: "zstd".to_string(),
+            ..ZswapStatus::default()
+        }
+    }
+
+    // ── compression_ratio ────────────────────────────────────────────────────
+
+    #[test]
+    fn compression_ratio_empty_pool_is_one() {
+        let s = sample_status();
+        assert!((s.compression_ratio() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compression_ratio_zero_stored_pages_is_one() {
+        let s = ZswapStatus {
+            pool_size: 1024,
+            stored_pages: 0,
+            ..sample_status()
+        };
+        assert!((s.compression_ratio() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compression_ratio_computed() {
+        let page = crate::meminfo::get_page_size();
+        // 1 page compressed into 1 page (worst case)
+        let s = ZswapStatus {
+            pool_size: page,
+            stored_pages: 1,
+            ..sample_status()
+        };
+        assert!((s.compression_ratio() - 1.0).abs() < 1e-9);
+
+        // 4 pages of original data compressed to 1 page → ~4x
+        let s = ZswapStatus {
+            pool_size: page,
+            stored_pages: 4,
+            ..sample_status()
+        };
+        assert!((s.compression_ratio() - 4.0).abs() < 1e-9);
+    }
+
+    // ── ram_usage_percent ────────────────────────────────────────────────────
+
+    #[test]
+    fn ram_usage_percent_zero_when_pool_empty() {
+        let s = sample_status();
+        assert_eq!(s.ram_usage_percent(), 0.0);
+    }
+
+    #[test]
+    fn ram_usage_percent_bounded() {
+        // Real RAM size is unknown in test but must be >0.
+        let s = ZswapStatus {
+            pool_size: 1024 * 1024,
+            ..sample_status()
+        };
+        let pct = s.ram_usage_percent();
+        assert!(pct >= 0.0);
+        assert!(pct <= 100.0, "got {}", pct);
+    }
+
+    // ── log_summary must not panic ───────────────────────────────────────────
+
+    #[test]
+    fn log_summary_disabled_is_noop() {
+        let s = ZswapStatus::default();
+        s.log_summary(); // enabled=false → returns early
+    }
+
+    #[test]
+    fn log_summary_enabled_runs() {
+        let s = ZswapStatus {
+            pool_size: 1024 * 1024,
+            stored_pages: 256,
+            pool_limit_hit: 1,
+            ..sample_status()
+        };
+        s.log_summary();
+    }
+}

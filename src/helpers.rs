@@ -278,3 +278,180 @@ macro_rules! debug {
         }
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    // ── parse_size (pure logic) ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_size_kib_suffix() {
+        assert_eq!(parse_size("512K").unwrap(), 512 * KB);
+    }
+
+    #[test]
+    fn parse_size_mib_suffix() {
+        assert_eq!(parse_size("128M").unwrap(), 128 * MB);
+    }
+
+    #[test]
+    fn parse_size_gib_suffix() {
+        assert_eq!(parse_size("2G").unwrap(), 2 * GB);
+    }
+
+    #[test]
+    fn parse_size_tib_suffix() {
+        assert_eq!(parse_size("1T").unwrap(), 1024 * GB);
+    }
+
+    #[test]
+    fn parse_size_lowercase_suffix() {
+        assert_eq!(parse_size("100m").unwrap(), 100 * MB);
+    }
+
+    #[test]
+    fn parse_size_raw_bytes() {
+        assert_eq!(parse_size("1048576").unwrap(), 1_048_576);
+    }
+
+    #[test]
+    fn parse_size_trims_whitespace() {
+        assert_eq!(parse_size("  4K  ").unwrap(), 4 * KB);
+    }
+
+    #[test]
+    fn parse_size_empty_errors() {
+        assert!(parse_size("").is_err());
+    }
+
+    #[test]
+    fn parse_size_garbage_errors() {
+        assert!(parse_size("abc").is_err());
+    }
+
+    #[test]
+    fn parse_size_negative_errors() {
+        assert!(parse_size("-100").is_err());
+    }
+
+    #[test]
+    fn parse_size_invalid_suffix_errors() {
+        assert!(parse_size("10Q").is_err());
+    }
+
+    // ── get_what_from_swap_unit ──────────────────────────────────────────────
+
+    #[test]
+    fn get_what_returns_device_path() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[Unit]\nDescription=Swap\n\n[Swap]\nWhat=/dev/zram0\nPriority=100"
+        )
+        .unwrap();
+        assert_eq!(
+            get_what_from_swap_unit(file.path()).as_deref(),
+            Some("/dev/zram0")
+        );
+    }
+
+    #[test]
+    fn get_what_missing_returns_none() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[Swap]\nPriority=100").unwrap();
+        assert!(get_what_from_swap_unit(file.path()).is_none());
+    }
+
+    #[test]
+    fn get_what_empty_value_returns_empty_string() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "What=").unwrap();
+        assert_eq!(get_what_from_swap_unit(file.path()).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn get_what_nonexistent_path_returns_none() {
+        assert!(get_what_from_swap_unit("/nonexistent/unit.swap").is_none());
+    }
+
+    // ── makedirs / force_remove / read_file ──────────────────────────────────
+
+    #[test]
+    fn makedirs_creates_nested_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a/b/c/d");
+        makedirs(&deep).unwrap();
+        assert!(deep.is_dir());
+    }
+
+    #[test]
+    fn makedirs_existing_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        makedirs(dir.path()).unwrap(); // existing dir must not error
+    }
+
+    #[test]
+    fn force_remove_nonexistent_noop() {
+        // Must not panic when target is missing.
+        force_remove("/nonexistent/path/xyz.swap", false);
+    }
+
+    #[test]
+    fn force_remove_existing_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        file.persist(&path).unwrap();
+        assert!(path.exists());
+        force_remove(&path, false);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn read_file_returns_content() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "hello\nworld").unwrap();
+        assert_eq!(read_file(file.path()).unwrap(), "hello\nworld");
+    }
+
+    #[test]
+    fn read_file_missing_errors() {
+        assert!(read_file("/nonexistent/file").is_err());
+    }
+
+    // ── relative_symlink ─────────────────────────────────────────────────────
+
+    #[test]
+    fn relative_symlink_creates_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "data").unwrap();
+        let link = dir.path().join("sub/link.txt");
+        makedirs(link.parent().unwrap()).unwrap();
+        relative_symlink(&target, &link).unwrap();
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "data");
+    }
+
+    #[test]
+    fn relative_symlink_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "data").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink("/nonexistent", &link).unwrap();
+        relative_symlink(&target, &link).unwrap();
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "data");
+    }
+
+    // ── write_file (real filesystem path, triggers sync_all) ─────────────────
+
+    #[test]
+    fn write_file_real_fs_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        write_file(&path, "content").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "content");
+    }
+}

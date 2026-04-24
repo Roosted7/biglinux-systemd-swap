@@ -738,3 +738,132 @@ fn autoconfig() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use systemd_swap::config::Config;
+
+    fn cfg(pairs: &[(&str, &str)]) -> Config {
+        Config::from_pairs_for_tests(pairs.iter().map(|(k, v)| (*k, *v)))
+    }
+
+    // ── get_swap_mode ────────────────────────────────────────────────────────
+
+    #[test]
+    fn swap_mode_defaults_to_auto_when_unset() {
+        assert_eq!(get_swap_mode(&cfg(&[])), SwapMode::Auto);
+    }
+
+    #[test]
+    fn swap_mode_auto_explicit() {
+        assert_eq!(get_swap_mode(&cfg(&[("swap_mode", "auto")])), SwapMode::Auto);
+    }
+
+    #[test]
+    fn swap_mode_case_insensitive() {
+        assert_eq!(get_swap_mode(&cfg(&[("swap_mode", "AUTO")])), SwapMode::Auto);
+        assert_eq!(
+            get_swap_mode(&cfg(&[("swap_mode", "Zram_Only")])),
+            SwapMode::ZramOnly
+        );
+    }
+
+    #[test]
+    fn swap_mode_zram_variants() {
+        for v in &["zram", "zram_only"] {
+            assert_eq!(
+                get_swap_mode(&cfg(&[("swap_mode", v)])),
+                SwapMode::ZramOnly,
+                "'{}'",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn swap_mode_zram_swapfc_variants() {
+        for v in &["zram+swapfc", "zram_swapfc", "zram+swapfile"] {
+            assert_eq!(
+                get_swap_mode(&cfg(&[("swap_mode", v)])),
+                SwapMode::ZramSwapfc,
+                "'{}'",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn swap_mode_zswap_variants() {
+        for v in &[
+            "zswap+swapfc",
+            "zswap",
+            "zswap+swapfile",
+            "zswap+loopfile",
+            "zswap_loopfile",
+        ] {
+            assert_eq!(
+                get_swap_mode(&cfg(&[("swap_mode", v)])),
+                SwapMode::ZswapSwapfc,
+                "'{}'",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn swap_mode_disabled() {
+        assert_eq!(
+            get_swap_mode(&cfg(&[("swap_mode", "disabled")])),
+            SwapMode::Disabled
+        );
+    }
+
+    #[test]
+    fn swap_mode_manual() {
+        assert_eq!(
+            get_swap_mode(&cfg(&[("swap_mode", "manual")])),
+            SwapMode::Manual
+        );
+    }
+
+    #[test]
+    fn swap_mode_unknown_falls_back_to_auto() {
+        assert_eq!(
+            get_swap_mode(&cfg(&[("swap_mode", "gibberish")])),
+            SwapMode::Auto
+        );
+    }
+
+    // ── format_size ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_size_bytes() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(512), "512 B");
+    }
+
+    #[test]
+    fn format_size_kib() {
+        assert_eq!(format_size(1024), "1 KiB");
+        assert_eq!(format_size(1024 * 100), "100 KiB");
+    }
+
+    #[test]
+    fn format_size_mib() {
+        assert_eq!(format_size(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_size(512 * 1024 * 1024), "512.0 MiB");
+    }
+
+    #[test]
+    fn format_size_gib() {
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.0 GiB");
+    }
+
+    #[test]
+    fn format_size_crosses_boundary() {
+        // 1 MiB - 1 byte still reported in KiB (1024 KiB rounds to 1024)
+        assert_eq!(format_size(1024 * 1024 - 1), "1024 KiB");
+    }
+}

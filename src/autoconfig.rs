@@ -212,3 +212,117 @@ impl RecommendedConfig {
         Self::zram_swapfc()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps(fstype: Option<&str>, ram: u64, free: u64, live: bool) -> SystemCapabilities {
+        SystemCapabilities {
+            swap_path_fstype: fstype.map(String::from),
+            free_disk_space_bytes: free,
+            total_ram_bytes: ram,
+            is_live_system: live,
+            cpu_count: 4,
+        }
+    }
+
+    // ── build_config decision tree ───────────────────────────────────────────
+
+    #[test]
+    fn live_system_uses_zram_only() {
+        let c = RecommendedConfig::from_capabilities(&caps(Some("overlay"), 8 * GB, 100 * GB, true));
+        assert_eq!(c.swap_mode, SwapMode::ZramOnly);
+        assert_eq!(c.swapfc_max_count, 0);
+    }
+
+    #[test]
+    fn unsupported_fs_uses_zram_only() {
+        let c = RecommendedConfig::from_capabilities(&caps(Some("zfs"), 8 * GB, 100 * GB, false));
+        assert_eq!(c.swap_mode, SwapMode::ZramOnly);
+    }
+
+    #[test]
+    fn unknown_fs_uses_zram_only() {
+        let c = RecommendedConfig::from_capabilities(&caps(None, 8 * GB, 100 * GB, false));
+        assert_eq!(c.swap_mode, SwapMode::ZramOnly);
+    }
+
+    #[test]
+    fn low_disk_uses_zram_only() {
+        // Free disk < RAM → zram only.
+        let c = RecommendedConfig::from_capabilities(&caps(Some("btrfs"), 16 * GB, 8 * GB, false));
+        assert_eq!(c.swap_mode, SwapMode::ZramOnly);
+    }
+
+    #[test]
+    fn btrfs_with_enough_disk_uses_zram_swapfc() {
+        let c = RecommendedConfig::from_capabilities(&caps(Some("btrfs"), 8 * GB, 100 * GB, false));
+        assert_eq!(c.swap_mode, SwapMode::ZramSwapfc);
+        assert_eq!(c.swapfc_max_count, defaults::SWAPFILE_MAX_COUNT);
+    }
+
+    #[test]
+    fn ext4_with_enough_disk_uses_zram_swapfc() {
+        let c = RecommendedConfig::from_capabilities(&caps(Some("ext4"), 4 * GB, 50 * GB, false));
+        assert_eq!(c.swap_mode, SwapMode::ZramSwapfc);
+    }
+
+    #[test]
+    fn xfs_with_enough_disk_uses_zram_swapfc() {
+        let c = RecommendedConfig::from_capabilities(&caps(Some("xfs"), 4 * GB, 50 * GB, false));
+        assert_eq!(c.swap_mode, SwapMode::ZramSwapfc);
+    }
+
+    // ── config_pairs output ──────────────────────────────────────────────────
+
+    #[test]
+    fn config_pairs_zram_only_has_no_swapfile_keys() {
+        let c = RecommendedConfig::zram_only();
+        let pairs = c.config_pairs();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"zram_alg"));
+        assert!(keys.contains(&"zram_size"));
+        assert!(keys.contains(&"zram_prio"));
+        assert!(keys.contains(&"mglru_min_ttl_ms"));
+        assert!(!keys.contains(&"swapfile_chunk_size"));
+        assert!(!keys.contains(&"swapfile_max_count"));
+    }
+
+    #[test]
+    fn config_pairs_zram_swapfc_has_swapfile_keys() {
+        let c = RecommendedConfig::zram_swapfc();
+        let pairs = c.config_pairs();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"swapfile_chunk_size"));
+        assert!(keys.contains(&"swapfile_max_count"));
+        assert!(keys.contains(&"swapfile_free_ram_perc"));
+        assert!(keys.contains(&"swapfile_free_swap_perc"));
+        assert!(keys.contains(&"swapfile_remove_free_swap_perc"));
+    }
+
+    #[test]
+    fn config_pairs_zram_size_is_percent_string() {
+        let c = RecommendedConfig::zram_only();
+        let pairs = c.config_pairs();
+        let (_, zram_size) = pairs.iter().find(|(k, _)| *k == "zram_size").unwrap();
+        assert!(zram_size.ends_with('%'), "got {}", zram_size);
+    }
+
+    #[test]
+    fn config_pairs_always_includes_mglru() {
+        for c in [
+            RecommendedConfig::zram_only(),
+            RecommendedConfig::zram_swapfc(),
+        ] {
+            let pairs = c.config_pairs();
+            assert!(pairs.iter().any(|(k, _)| *k == "mglru_min_ttl_ms"));
+        }
+    }
+
+    #[test]
+    fn default_is_zram_only() {
+        let c = RecommendedConfig::default();
+        assert_eq!(c.swap_mode, SwapMode::ZramOnly);
+    }
+}
