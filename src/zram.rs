@@ -422,11 +422,18 @@ impl ZramPool {
                 continue; // Not initialized
             }
 
-            // Check if it's an active swap device via /proc/swaps
+            // Check if it's an active swap device via /proc/swaps.
+            // Use exact field match — substring matching would confuse
+            // /dev/zram1 with /dev/zram10.
             let Ok(swaps) = std::fs::read_to_string("/proc/swaps") else {
                 continue;
             };
-            if !swaps.contains(&dev_path) {
+            let is_active = swaps
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_whitespace().next())
+                .any(|filename| filename == dev_path);
+            if !is_active {
                 continue;
             }
 

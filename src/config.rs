@@ -228,19 +228,23 @@ impl Config {
                 let right = expr[pos + 1..].trim();
                 if let (Ok(l), Ok(r)) = (left.parse::<i64>(), right.parse::<i64>()) {
                     let result = match op {
-                        '+' => l + r,
-                        '-' => l - r,
-                        '*' => l * r,
+                        '+' => l.checked_add(r),
+                        '-' => l.checked_sub(r),
+                        '*' => l.checked_mul(r),
                         '/' => {
                             if r != 0 {
-                                l / r
+                                l.checked_div(r)
                             } else {
-                                0
+                                Some(0)
                             }
                         }
                         _ => unreachable!(),
                     };
-                    return result.to_string();
+                    if let Some(v) = result {
+                        return v.to_string();
+                    }
+                    // Overflow: fall through and return expression unchanged
+                    break;
                 }
             }
         }
@@ -335,6 +339,13 @@ mod tests {
             Config::evaluate_simple_arithmetic("not_a_number"),
             "not_a_number"
         );
+    }
+
+    #[test]
+    fn arith_overflow_returns_expr() {
+        // i64::MAX * 2 would overflow: must not panic, returns expression unchanged.
+        let expr = format!("{} * 2", i64::MAX);
+        assert_eq!(Config::evaluate_simple_arithmetic(&expr), expr);
     }
 
     // ── Config::get_bool ─────────────────────────────────────────────────────

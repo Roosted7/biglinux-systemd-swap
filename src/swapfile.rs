@@ -689,8 +689,9 @@ impl SwapFile {
             let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, idx);
             force_remove(&loop_info_path, false);
 
-            // Update file_sizes if we tracked this file
-            if idx <= self.file_sizes.len() as u32 {
+            // Update file_sizes if we tracked this file.
+            // Guard against idx==0 (would underflow (idx-1) as usize).
+            if idx > 0 && idx <= self.file_sizes.len() as u32 {
                 self.file_sizes.remove((idx - 1) as usize);
             }
         }

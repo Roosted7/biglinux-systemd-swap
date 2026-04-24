@@ -376,24 +376,32 @@ fn run_zram_only(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
     match systemd_swap::zram::ZramPool::new(config) {
         Ok(mut pool) => {
-            if let Err(e) = pool.start_primary() {
-                error!("ZramPool: {}", e);
-            }
+            let start_ok = match pool.start_primary() {
+                Ok(()) => true,
+                Err(e) => {
+                    error!("ZramPool: {}", e);
+                    false
+                }
+            };
             notify_ready();
             info!("ZramPool setup complete");
 
-            if let Err(e) = pool.run_monitor() {
-                warn!("ZramPool monitor error: {}", e);
+            if start_ok {
+                if let Err(e) = pool.run_monitor() {
+                    warn!("ZramPool monitor error: {}", e);
+                }
+            } else {
+                // No devices — idle until shutdown instead of looping in monitor.
+                while !systemd_swap::is_shutdown() {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                }
             }
         }
         Err(e) => {
             error!("ZramPool: {}", e);
             notify_ready();
-            loop {
+            while !systemd_swap::is_shutdown() {
                 std::thread::sleep(std::time::Duration::from_secs(60));
-                if systemd_swap::is_shutdown() {
-                    break;
-                }
             }
         }
     }
