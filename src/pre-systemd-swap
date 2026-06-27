@@ -141,4 +141,15 @@ if [[ -n "$total_ram_kb" ]]; then
     echo "$min_free" > /proc/sys/vm/min_free_kbytes
 fi
 
+# Transparent Huge Pages: madvise instead of the kernel default 'always'.
+# 'always' promotes anonymous ranges to 2MB huge pages aggressively, wasting
+# RAM via internal fragmentation on a desktop (a process touching part of a 2MB
+# page keeps the whole page) — measured ~hundreds of MB of AnonHugePages.
+# 'madvise' only uses huge pages where explicitly requested (madvise(MADV_HUGEPAGE)).
+thp="/sys/kernel/mm/transparent_hugepage/enabled"
+if [[ -w "$thp" ]]; then
+    log_info "Setting transparent_hugepage = madvise"
+    echo madvise > "$thp"
+fi
+
 log_info "Pre-systemd-swap setup complete"
