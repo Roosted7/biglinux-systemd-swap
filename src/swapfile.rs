@@ -108,7 +108,7 @@ pub struct SwapFileConfig {
 /// `configured` accepts a percentage ("5%") or a size ("2G"). An explicit value
 /// is taken as given; only the automatic default is clamped, since an admin
 /// asking for a specific reserve has already made the judgement.
-fn resolve_min_free(fs_total: u64, configured: Option<&str>) -> u64 {
+pub fn resolve_min_free(fs_total: u64, configured: Option<&str>) -> u64 {
     // Multiply before dividing, in u128 so a filesystem large enough to
     // overflow the intermediate cannot exist.
     let percent_of_total = |p: u64| -> u64 { ((fs_total as u128 * p as u128) / 100) as u64 };
@@ -137,7 +137,7 @@ fn resolve_min_free(fs_total: u64, configured: Option<&str>) -> u64 {
 }
 
 /// Bytes not yet allocated to any btrfs chunk, from `btrfs filesystem usage -b`.
-fn parse_btrfs_unallocated(output: &str) -> Option<u64> {
+pub fn parse_btrfs_unallocated(output: &str) -> Option<u64> {
     output.lines().find_map(|line| {
         line.trim()
             .strip_prefix("Device unallocated:")
