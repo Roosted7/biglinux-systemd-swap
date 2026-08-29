@@ -46,6 +46,18 @@ pub fn is_available() -> bool {
     Path::new(ZRAM_MODULE).is_dir()
 }
 
+/// Whether `dev_path` is listed as active swap in the given /proc/swaps text.
+///
+/// Compares the first field exactly rather than searching for a substring,
+/// which would match /dev/zram1 against a line for /dev/zram10.
+fn swap_in_use(swaps: &str, dev_path: &str) -> bool {
+    swaps
+        .lines()
+        .skip(1) // header
+        .filter_map(|line| line.split_whitespace().next())
+        .any(|filename| filename == dev_path)
+}
+
 /// Set comp_algorithm for a ZRAM device.
 fn configure_zram_algorithm(sysfs: &str, comp_alg: &str, ctx: &str) {
     let comp_path = format!("{}/comp_algorithm", sysfs);
@@ -456,17 +468,10 @@ impl ZramPool {
             }
 
             // Check if it's an active swap device via /proc/swaps.
-            // Use exact field match — substring matching would confuse
-            // /dev/zram1 with /dev/zram10.
             let Ok(swaps) = std::fs::read_to_string("/proc/swaps") else {
                 continue;
             };
-            let is_active = swaps
-                .lines()
-                .skip(1)
-                .filter_map(|line| line.split_whitespace().next())
-                .any(|filename| filename == dev_path);
-            if !is_active {
+            if !swap_in_use(&swaps, &dev_path) {
                 continue;
             }
 
@@ -506,7 +511,17 @@ impl ZramPool {
         let Ok(entries) = std::fs::read_dir("/sys/block") else {
             return 0;
         };
-        let swaps = std::fs::read_to_string("/proc/swaps").unwrap_or_default();
+
+        // Fail closed. Treating an unreadable /proc/swaps as "nothing is in
+        // use" would mark every initialised device an orphan, so the sweep
+        // would try to release devices that are actively serving swap. The
+        // kernel refuses those with EBUSY, but only after the retry loop has
+        // spent a second on each one.
+        let Ok(swaps) = std::fs::read_to_string("/proc/swaps") else {
+            warn!("ZramPool: cannot read /proc/swaps, skipping orphan reclamation");
+            return 0;
+        };
+
         let mut reclaimed = 0;
 
         for entry in entries.flatten() {
@@ -530,14 +545,8 @@ impl ZramPool {
                 continue;
             }
 
-            // Exact field match: a substring test would confuse zram1 with zram10.
             let dev_path = format!("/dev/zram{}", id);
-            let in_use = swaps
-                .lines()
-                .skip(1)
-                .filter_map(|line| line.split_whitespace().next())
-                .any(|filename| filename == dev_path);
-            if in_use {
+            if swap_in_use(&swaps, &dev_path) {
                 continue;
             }
 
@@ -1177,6 +1186,54 @@ fn get_device_stats(sysfs_path: &str, disksize: u64) -> Option<ZramStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── /proc/swaps parsing ──────────────────────────────────────────────────
+    //
+    // Getting this wrong reclaims a device that is serving swap, so the
+    // near-miss cases are worth pinning down.
+
+    const SWAPS: &str = "\
+Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority
+/dev/zram1                              partition\t24581068\t12628\t\t32767
+/dev/zram10                             partition\t24581068\t0\t\t32767
+/swapfile/1                             file\t\t524284\t\t0\t\t-2
+";
+
+    #[test]
+    fn swap_in_use_matches_whole_field() {
+        assert!(swap_in_use(SWAPS, "/dev/zram1"));
+        assert!(swap_in_use(SWAPS, "/dev/zram10"));
+        assert!(swap_in_use(SWAPS, "/swapfile/1"));
+    }
+
+    #[test]
+    fn swap_in_use_rejects_prefixes_and_substrings() {
+        // /dev/zram1 must not be found via the /dev/zram10 line, nor the
+        // reverse, and a partial path must not match either.
+        assert!(!swap_in_use("/dev/zram10 partition 1 0 -2\n", "/dev/zram1"));
+        assert!(!swap_in_use("/dev/zram1 partition 1 0 -2\n", "/dev/zram10"));
+        assert!(!swap_in_use(SWAPS, "/dev/zram"));
+        assert!(!swap_in_use(SWAPS, "zram1"));
+    }
+
+    #[test]
+    fn swap_in_use_skips_the_header_row() {
+        // A device literally named "Filename" is absurd, but the header must
+        // not be treated as data regardless.
+        assert!(!swap_in_use(SWAPS, "Filename"));
+    }
+
+    #[test]
+    fn swap_in_use_on_empty_input_finds_nothing() {
+        assert!(!swap_in_use("", "/dev/zram1"));
+        // Header only, no swap active.
+        assert!(!swap_in_use("Filename\tType\tSize\tUsed\tPriority\n", "/dev/zram1"));
+    }
+
+    #[test]
+    fn swap_in_use_absent_device() {
+        assert!(!swap_in_use(SWAPS, "/dev/zram2"));
+    }
 
     fn stats(orig: u64, compr: u64, disk: u64) -> ZramStats {
         ZramStats {
