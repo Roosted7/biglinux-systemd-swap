@@ -468,6 +468,14 @@ fn stop(on_init: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     if !on_init {
         notify_stopping();
+
+        // Tell a daemon still running alongside this process that swap is on
+        // its way out. Without it the monitors read their own teardown as
+        // memory pressure and allocate while we are removing things.
+        let _ = makedirs(WORK_DIR);
+        if let Err(e) = fs::write(systemd_swap::STOPPING_MARKER, "") {
+            warn!("Could not mark teardown in progress: {}", e);
+        }
     }
 
     let config = Config::load()?;

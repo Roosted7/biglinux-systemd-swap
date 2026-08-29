@@ -17,7 +17,7 @@ use crate::meminfo::{get_free_ram_percent, get_free_swap_percent_effective};
 use crate::systemd::{
     gen_swap_unit, notify_ready, notify_status, swapoff, systemctl, SystemctlAction,
 };
-use crate::{debug, info, is_shutdown, warn};
+use crate::{debug, info, stop_in_progress, warn};
 
 #[derive(Error, Debug)]
 pub enum SwapFileError {
@@ -1115,7 +1115,7 @@ impl SwapFile {
             let poll_interval = self.get_adaptive_poll_interval();
             thread::sleep(Duration::from_secs(poll_interval));
 
-            if is_shutdown() {
+            if stop_in_progress() {
                 break;
             }
 
