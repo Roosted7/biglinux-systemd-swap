@@ -213,8 +213,46 @@ fn recompress_device(sysfs: &str, idle_age: u64, ctx: &str) {
         return;
     }
 
+    let before = compressed_bytes(sysfs);
+
     if let Err(e) = std::fs::write(format!("{}/recompress", sysfs), "type=idle") {
         warn!("{}: recompression pass failed: {}", ctx, e);
+        return;
+    }
+
+    // Promotion re-allocates: the object is freed from the zsmalloc size class
+    // its lz4-compressed form occupied and allocated into a smaller one. That
+    // leaves partly filled zspages behind, so without compaction some of the
+    // ratio just gained is handed straight back as fragmentation.
+    //
+    // Only worth doing when something actually moved. Concurrent swap traffic
+    // makes this approximate; a sweep wrongly judged idle is simply compacted
+    // on the next turn.
+    match (before, compressed_bytes(sysfs)) {
+        (Some(before), Some(after)) if after < before => compact_device(sysfs, ctx),
+        (None, _) | (_, None) => compact_device(sysfs, ctx),
+        _ => {}
+    }
+}
+
+/// compr_data_size, field 1 of mm_stat.
+fn compressed_bytes(sysfs: &str) -> Option<u64> {
+    std::fs::read_to_string(format!("{}/mm_stat", sysfs))
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Ask zsmalloc to migrate objects out of partly filled zspages.
+fn compact_device(sysfs: &str, ctx: &str) {
+    let path = format!("{}/compact", sysfs);
+    if !Path::new(&path).exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, "1") {
+        warn!("{}: compaction failed: {}", ctx, e);
     }
 }
 
@@ -1277,13 +1315,14 @@ impl ZramPool {
             if log_counter * check_interval >= 30 {
                 log_counter = 0;
                 info!(
-                    "ZramPool: {} dev(s), util={}%, ratio={:.2}x, phys={}% ({}MB/{}MB)",
+                    "ZramPool: {} dev(s), util={}%, ratio={:.2}x, phys={}% ({}MB/{}MB), compacted={}",
                     stats.device_count,
                     stats.utilization_percent,
                     stats.compression_ratio,
                     stats.phys_usage_percent,
                     stats.total_phys_used / (1024 * 1024),
-                    self.ram_total / (1024 * 1024)
+                    self.ram_total / (1024 * 1024),
+                    stats.total_pages_compacted
                 );
             }
 
@@ -1708,6 +1747,24 @@ Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority
                 );
             }
         }
+    }
+
+    #[test]
+    fn compressed_bytes_reads_field_1_of_mm_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        // orig compr mem_used mem_limit mem_used_max same_pages compacted huge
+        std::fs::write(
+            dir.path().join("mm_stat"),
+            "4194304 1048576 1310720 0 1310720 0 12 0\n",
+        )
+        .unwrap();
+        assert_eq!(compressed_bytes(dir.path().to_str().unwrap()), Some(1048576));
+    }
+
+    #[test]
+    fn compressed_bytes_absent_on_unreadable_device() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(compressed_bytes(dir.path().to_str().unwrap()), None);
     }
 
     #[test]
