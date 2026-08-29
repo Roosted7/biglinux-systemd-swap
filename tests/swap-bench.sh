@@ -25,7 +25,7 @@ MEM_MAX="${MEM_MAX:-8G}"          # cgroup ceiling for the whole load
 SWAP_MAX="${SWAP_MAX:-6G}"        # how much of it may spill
 WORKERS="${WORKERS:-6}"
 DURATION="${DURATION:-600}"       # seconds; must exceed zram_recomp_idle_age
-SAMPLE="${SAMPLE:-10}"            # seconds between samples
+SAMPLE="${SAMPLE:-5}"             # seconds between samples; fine enough to see the spill
 OUT="${OUT:-/tmp/swap-bench.$(date +%s)}"
 
 mkdir -p "$OUT"
@@ -82,13 +82,46 @@ print(f"worker {idx}: {len(pages) * MIB / MIB:.0f} MiB resident", flush=True)
 hot  = max(1, len(pages) // 10)
 warm = max(1, len(pages) //  3)
 
-while True:
+# Touch a random 4K page inside the block, not byte 0. A block is 256 kernel
+# pages; touching only the first keeps that one page resident forever and never
+# faults the other 255 back, so the first version could not generate a single
+# swap-in no matter how long it ran.
+PAGE = 4096
+BATCH = int(os.environ.get("BATCH", "32"))
+
+# Derive the sleep from a target rate so the load is stated in MB/s rather than
+# in a sleep value whose meaning depends on the batch size.
+TOUCH_MBPS = float(os.environ.get("TOUCH_MBPS", "5"))
+interval = (BATCH * PAGE) / (TOUCH_MBPS * MIB)
+
+# Replace a share of the blocks periodically. Without this the working set is
+# allocated once and never changes, so the only swap traffic is the initial
+# spill and everything after it is a static picture.
+CHURN = float(os.environ.get("CHURN", "0.02"))
+CHURN_EVERY = float(os.environ.get("CHURN_EVERY", "10"))
+
+def pick():
     r = random.random()
-    if r < 0.80:   i = random.randrange(0, hot)
-    elif r < 0.95: i = random.randrange(hot, warm)
-    else:          i = random.randrange(warm, len(pages))
-    pages[i][0] = (pages[i][0] + 1) % 256
-    time.sleep(rate)
+    if r < 0.80:   return random.randrange(0, hot)
+    elif r < 0.95: return random.randrange(hot, warm)
+    else:          return random.randrange(warm, len(pages))
+
+last_churn = time.time()
+while True:
+    for _ in range(BATCH):
+        blk = pages[pick()]
+        off = random.randrange(0, len(blk) // PAGE) * PAGE
+        blk[off] = (blk[off] + 1) % 256
+    time.sleep(interval)
+
+    now = time.time()
+    if now - last_churn >= CHURN_EVERY:
+        last_churn = now
+        # Freeing a block and allocating a fresh one is what keeps reclaim
+        # working: the old pages go away, the new ones have to displace
+        # something.
+        for _ in range(max(1, int(len(pages) * CHURN))):
+            pages[random.randrange(len(pages))] = bytearray(block())
 PY
 
 # ── The canary ──────────────────────────────────────────────────────────────
@@ -177,26 +210,35 @@ systemd-run --quiet --scope --collect \
     ' > "$OUT/workers.log" 2>&1 &
 SCOPE_PID=$!
 
-# Give the workers time to allocate, then confirm the load is the size asked
-# for. A load that quietly allocates a fraction of its target produces a clean
-# run with nothing in it.
+# Find the cgroup straight away. The spill happens while the workers allocate,
+# so waiting for them to settle before sampling misses the only period with
+# sustained swap traffic in it: the previous version slept 30s here and then
+# reported 0 MB/s for a run that had moved 4GB.
+for _ in $(seq 1 50); do
+    CGROUP="$(find_cgroup)"
+    [ -n "$CGROUP" ] && break
+    sleep 0.2
+done
+[ -n "$CGROUP" ] || echo "cgroup: not found - cg_swap will read 0"
+
+# Sample from t=0, in the background, so allocation is covered.
+(
+    for ((t=0; t<DURATION; t+=SAMPLE)); do
+        sample "$t"
+        sleep "$SAMPLE"
+    done
+) &
+SAMPLER_PID=$!
+
 sleep 30
 echo "--- allocation ---"
-cat "$OUT/workers.log" 2>/dev/null | head -n "$WORKERS"
+head -n "$WORKERS" "$OUT/workers.log" 2>/dev/null
 resident=$(ps -o rss= -C python3 2>/dev/null | awk '{s+=$1} END {print int(s/1024)}')
 echo "resident total: ${resident}MB   target: ${TOTAL_MB}MB   ceiling: $MEM_MAX"
-CGROUP="$(find_cgroup)"
-if [ -n "$CGROUP" ]; then
-    echo "cgroup:  $CGROUP"
-else
-    echo "cgroup:  not found - cg_swap will read 0, swap numbers will be system-wide"
-fi
+echo "cgroup:  ${CGROUP:-none}"
 echo
 
-for ((t=0; t<DURATION; t+=SAMPLE)); do
-    sample "$t"
-    sleep "$SAMPLE"
-done
+wait "$SAMPLER_PID" 2>/dev/null || true
 
 kill "$SCOPE_PID" 2>/dev/null || true
 systemctl stop "swap-bench-$$.scope" 2>/dev/null || true
@@ -211,8 +253,15 @@ if len(rows) < 2:
     print("not enough samples"); sys.exit()
 f,l=rows[0],rows[-1]
 dt=int(l[0])-int(f[0]) or 1
-print(f"swap_out  {(int(l[2])-int(f[2]))*4096/2**20/dt:.1f} MB/s")
-print(f"swap_in   {(int(l[1])-int(f[1]))*4096/2**20/dt:.1f} MB/s")
+print(f"swap_out  {(int(l[2])-int(f[2]))*4096/2**20/dt:.1f} MB/s avg")
+print(f"swap_in   {(int(l[1])-int(f[1]))*4096/2**20/dt:.1f} MB/s avg")
+# The spill is short and early, so an average over the whole run buries it.
+peaks_out = max((int(b[2])-int(a[2]))*4096/2**20/max(1,int(b[0])-int(a[0]))
+                for a, b in zip(rows, rows[1:]))
+peaks_in = max((int(b[1])-int(a[1]))*4096/2**20/max(1,int(b[0])-int(a[0]))
+               for a, b in zip(rows, rows[1:]))
+print(f"peak_out  {peaks_out:.1f} MB/s")
+print(f"peak_in   {peaks_in:.1f} MB/s")
 print(f"psi_some  {(int(l[3])-int(f[3]))/1e6/dt*100:.2f}% of wall")
 print(f"psi_full  {(int(l[4])-int(f[4]))/1e6/dt*100:.2f}% of wall")
 if len(l) > 9:
