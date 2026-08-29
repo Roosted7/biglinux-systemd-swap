@@ -1440,11 +1440,14 @@ impl SwapFile {
                 idx,
                 chunk_size / (1024 * 1024)
             );
-            {
+            // The space check happens before this write, and the write is what
+            // actually consumes the space, so the filesystem can fill in
+            // between: statvfs is a snapshot and other writers exist. Roll back
+            // on failure like the truncate and mkswap paths below, or a partial
+            // file is left on disk while still counted as allocated.
+            let fill = (|| -> std::io::Result<()> {
                 use std::io::Write;
-                let f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&swapfile_path)?;
+                let f = std::fs::OpenOptions::new().write(true).open(&swapfile_path)?;
                 let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, f);
                 let zeros = vec![0u8; 1024 * 1024];
                 let chunks = chunk_size / (1024 * 1024);
@@ -1455,7 +1458,20 @@ impl SwapFile {
                 if remainder > 0 {
                     writer.write_all(&vec![0u8; remainder])?;
                 }
-                writer.flush()?;
+                writer.flush()
+            })();
+
+            if let Err(e) = fill {
+                warn!(
+                    "swapFC: could not fill {} ({}), removing partial file",
+                    swapfile_path.display(),
+                    e
+                );
+                force_remove(&swapfile_path, false);
+                self.allocated -= 1;
+                self.file_sizes.pop();
+                self.disk_full = true;
+                return Err(SwapFileError::Io(e));
             }
             (swapfile_path.to_string_lossy().to_string(), None)
         };
