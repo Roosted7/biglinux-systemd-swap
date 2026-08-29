@@ -30,7 +30,11 @@ pub fn request_shutdown() {
 }
 
 /// Marker `systemd-swap stop` leaves while it tears swap down.
-pub const STOPPING_MARKER: &str = "/run/systemd/swap/stopping";
+///
+/// Deliberately outside the work directory, which stop() removes partway
+/// through its own teardown. A marker in there would be deleted while swap
+/// files are still being removed, reopening the window it exists to close.
+pub const STOPPING_MARKER: &str = "/run/systemd-swap.stopping";
 
 /// Whether swap is going away, either because this process was signalled or
 /// because a stop is running alongside it.

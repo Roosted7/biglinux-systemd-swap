@@ -198,6 +198,10 @@ fn configure_mglru(config: &Config, recommended: Option<&RecommendedConfig>) {
 fn start() -> Result<(), Box<dyn std::error::Error>> {
     am_i_root()?;
 
+    // A stop that died partway through leaves the marker behind, which would
+    // tell this instance's monitors to stay idle forever.
+    let _ = fs::remove_file(systemd_swap::STOPPING_MARKER);
+
     // Detect system capabilities for autoconfig
     let caps = SystemCapabilities::detect();
     let recommended = RecommendedConfig::from_capabilities(&caps);
@@ -472,7 +476,6 @@ fn stop(on_init: bool) -> Result<(), Box<dyn std::error::Error>> {
         // Tell a daemon still running alongside this process that swap is on
         // its way out. Without it the monitors read their own teardown as
         // memory pressure and allocate while we are removing things.
-        let _ = makedirs(WORK_DIR);
         if let Err(e) = fs::write(systemd_swap::STOPPING_MARKER, "") {
             warn!("Could not mark teardown in progress: {}", e);
         }
@@ -556,6 +559,12 @@ fn stop(on_init: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+    }
+
+    // Last, so it covers every step above. Leaving it behind would make a
+    // later daemon believe a teardown is permanently in progress.
+    if !on_init {
+        let _ = fs::remove_file(systemd_swap::STOPPING_MARKER);
     }
 
     Ok(())

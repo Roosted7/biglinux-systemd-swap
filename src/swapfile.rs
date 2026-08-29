@@ -763,6 +763,31 @@ impl SwapFile {
         None
     }
 
+    /// Index of the loop_info file recording `loop_dev`, if we wrote one.
+    ///
+    /// Reads the directory rather than probing indices 1..=max_count: indices
+    /// are never reused, so they climb past max_count as files are created and
+    /// removed, and a bounded probe would stop finding them.
+    fn loop_info_index(&self, loop_dev: &str) -> Option<u32> {
+        let loop_dir = format!("{}/swapfile", WORK_DIR);
+        let entries = std::fs::read_dir(&loop_dir).ok()?;
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let Some(idx) = fname.to_string_lossy().strip_prefix("loop_").map(String::from) else {
+                continue;
+            };
+            let Ok(idx) = idx.parse::<u32>() else {
+                continue;
+            };
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                if content.lines().next() == Some(loop_dev) {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
     /// Adopt swap files that already exist from a previous run.
     /// Called before create_initial_swap() so we never swapoff active files on restart.
     fn adopt_existing_swapfiles(&mut self) {
@@ -793,16 +818,8 @@ impl SwapFile {
             }
             // For loop devices, derive the backing file number from the loop info file.
             if info.path.to_string_lossy().starts_with("/dev/loop") {
-                let loop_name = info.path.to_string_lossy();
-                // Find the matching loop info file we just wrote
-                for i in 1..=28u32 {
-                    let loop_info = format!("{}/swapfile/loop_{}", WORK_DIR, i);
-                    if let Ok(content) = fs::read_to_string(&loop_info) {
-                        if content.lines().next() == Some(&loop_name) {
-                            found.insert(i);
-                            break;
-                        }
-                    }
+                if let Some(i) = self.loop_info_index(&info.path.to_string_lossy()) {
+                    found.insert(i);
                 }
             }
         }
