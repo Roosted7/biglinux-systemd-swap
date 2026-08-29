@@ -55,7 +55,51 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[ "$(id -u)" -eq 0 ] || { echo "must run as root (losetup/mount)" >&2; exit 1; }
+if [ ! -x "$SPACECHECK" ]; then
+    echo "building spacecheck..."
+    (cd "$REPO" && cargo build --quiet --example spacecheck)
+fi
+
+# ── Without root: sweep the policy instead of real filesystems ───────────────
+#
+# Mounting a filesystem image needs real CAP_SYS_ADMIN. tmpfs can be mounted in
+# an unprivileged user namespace, but loop devices cannot, and btrfs/ext4/xfs
+# are not among the types permitted there. So the accounting behaviour of a
+# filling filesystem is root-only.
+#
+# The decision policy is not: feeding the numbers in directly exercises the
+# same resolve_min_free the daemon uses. That covers every size and fill level
+# cheaply, and is what most reviewing is about. What it cannot show is whether
+# a real filesystem reports the numbers we expect at 99% full, which is exactly
+# where btrfs stops being predictable.
+policy_sweep() {
+    echo "Policy sweep (no root: simulated filesystems, real decision logic)"
+    echo "Reserve must survive the allocation, so ALLOW needs free >= chunk + reserve."
+    echo
+    printf '%8s %6s %8s %8s  %s\n' TOTAL FULL FREE RESERVE DECISION
+    for total in 2 8 32 100 512 4096; do
+        for pct in 50 90 95 99; do
+            local free=$(( total * (100 - pct) / 100 ))
+            printf '%7sG %5s%% %7sG ' "$total" "$pct" "$free"
+            "$SPACECHECK" --simulate "${total}G" "${free}G" - "$CHUNK" \
+                | sed -E 's/total=[^ ]* free=[^ ]* //; s/unallocated=- btrfs_ok=- //'
+        done
+    done
+    echo
+    echo "btrfs unallocated check (100G filesystem, 20G free, so space alone would allow):"
+    for unalloc in 4G 2G 1G 512M 0; do
+        printf '  unallocated=%-6s ' "$unalloc"
+        "$SPACECHECK" --simulate 100G 20G "$unalloc" "$CHUNK" \
+            | sed 's/total=[^ ]* free=[^ ]* reserve=[^ ]* chunk=[^ ]* //'
+    done
+    echo
+    echo "For real filesystem behaviour, run as root:  sudo -E $0"
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    policy_sweep
+    exit 0
+fi
 
 # Images are created and removed one at a time, so the peak is the largest one
 # filled to the highest step, plus room for the filesystem's own metadata.
@@ -106,11 +150,6 @@ EOF
     WORK="$(mktemp -d "$WORKDIR/fs-margins.XXXXXX")"
 fi
 echo
-
-if [ ! -x "$SPACECHECK" ]; then
-    echo "building spacecheck..."
-    (cd "$REPO" && cargo build --quiet --example spacecheck)
-fi
 
 # One random block reused for the whole fill. Incompressible, so neither the
 # inner filesystem nor a compressing host can make the fill a lie, and far
