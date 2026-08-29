@@ -29,17 +29,36 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     die "Configuration file not found: $CONFIG_FILE"
 fi
 
-# Extract swapfile_path folder name (second component of path).
-# Prefer new key (swapfile_path), fall back to legacy (swapfc_path).
-# grep returns exit 1 when no match; || true prevents set -e from aborting.
-swapfcfolder=$(grep -E "^(swapfile_path|swapfc_path)=" "$CONFIG_FILE" \
+# Extract swapfile_path. Prefer new key (swapfile_path), fall back to legacy
+# (swapfc_path). grep returns exit 1 when no match; || true prevents set -e
+# from aborting. cut -d'#' strips inline comments, as the daemon's parser does.
+swapfcpath=$(grep -E "^(swapfile_path|swapfc_path)=" "$CONFIG_FILE" \
     | tail -n 1 \
-    | cut -d'=' -f2 \
-    | cut -d'/' -f2 || true)
+    | cut -d'=' -f2- \
+    | cut -d'#' -f1 \
+    | tr -d '[:space:]' || true)
+
+if [[ -z "$swapfcpath" ]]; then
+    # Default path mirrors defaults::SWAPFILE_PATH in src/defaults.rs
+    swapfcpath="/swapfile"
+fi
+
+# The setup below maps this to subvolume @<folder> mounted at /<folder>, so
+# only single-component absolute paths work. Taking the second component of
+# /var/swap gave folder "var", mounting a new @var over the live /var.
+if [[ "$swapfcpath" != /* ]]; then
+    die "swapfile_path must be an absolute path, got: $swapfcpath"
+fi
+
+swapfcfolder="${swapfcpath#/}"
+swapfcfolder="${swapfcfolder%/}"
 
 if [[ -z "$swapfcfolder" ]]; then
-    # Default path mirrors defaults::SWAPFILE_PATH in src/defaults.rs
-    swapfcfolder="swapfile"
+    die "swapfile_path must not be the filesystem root"
+fi
+
+if [[ "$swapfcfolder" == */* ]]; then
+    die "swapfile_path must be a single top-level directory such as /swapfile, got: $swapfcpath"
 fi
 
 # Only zram and disabled never create swap files. auto is resolved by the
