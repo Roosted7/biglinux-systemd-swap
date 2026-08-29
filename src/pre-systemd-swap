@@ -90,7 +90,9 @@ if [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
         log_info "Adding subvolume to /etc/fstab"
         uuid=$(blkid -s UUID -o value "$rootpartition")
         if [[ -n "$uuid" ]]; then
-            echo "UUID=$uuid /$swapfcfolder btrfs subvol=/@$swapfcfolder,defaults,noatime 0 0" >>/etc/fstab
+            # nofail: this subvolume only holds swap overflow files, so failing
+            # to mount it should cost swap capacity, not fail local-fs.target.
+            echo "UUID=$uuid /$swapfcfolder btrfs subvol=/@$swapfcfolder,defaults,noatime,nofail 0 0" >>/etc/fstab
         else
             die "Could not get UUID for $rootpartition"
         fi
