@@ -135,6 +135,12 @@ which walks the entry table in proportion to disksize rather than to how much
 of the device is in use, so a very large
 .B zram_size
 is the case for raising this rather than lowering it.
+.sp
+Sweeps are interleaved across the pool. One device is swept every interval
+divided by the device count, so each device is still swept once per interval
+while each burst covers only its share of the pool. The kernel promotes every
+idle page in a single blocking write with no way to bound the work, so
+splitting across devices is what makes the batches smaller.
 .PP
 The following options are available in the "swapfc" section:
 .I

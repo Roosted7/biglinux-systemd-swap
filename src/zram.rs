@@ -545,6 +545,8 @@ pub struct ZramPool {
     last_expansion: Option<Instant>,
     last_contraction: Option<Instant>,
     low_util_since: Option<Instant>,
+    /// Round-robin position for promotion sweeps
+    recomp_cursor: usize,
 }
 
 impl ZramPool {
@@ -573,6 +575,7 @@ impl ZramPool {
             last_expansion: None,
             last_contraction: None,
             low_util_since: None,
+            recomp_cursor: 0,
         })
     }
 
@@ -872,23 +875,55 @@ impl ZramPool {
     }
 
     /// Promote idle pages into the main algorithm on every active device.
-    fn recompress_all(&self) {
-        for dev in self
+    /// Promote idle pages on one device, advancing the round-robin cursor.
+    ///
+    /// Sweeping one device per turn rather than all of them keeps each device's
+    /// sweep period at recomp_interval while making each burst a fraction of
+    /// the size. The kernel recompresses every idle page in a single blocking
+    /// write with no way to bound the work, so splitting across devices is the
+    /// only way to chop that up.
+    fn recompress_next(&mut self) {
+        let active: Vec<usize> = self
             .devices
             .iter()
-            .filter(|d| d.state == ZramDeviceState::Active)
-        {
-            // Devices adopted from a kernel without multi-stage compression
-            // have no second rung to promote into.
-            if !recompression_supported(&dev.sysfs_path) {
-                continue;
-            }
-            recompress_device(
-                &dev.sysfs_path,
-                self.config.recomp_idle_age,
-                &format!("ZramPool: zram{}", dev.id),
-            );
+            .enumerate()
+            .filter(|(_, d)| d.state == ZramDeviceState::Active)
+            .map(|(i, _)| i)
+            .collect();
+
+        if active.is_empty() {
+            return;
         }
+
+        // The pool expands and contracts underneath this, so wrap against the
+        // current active list rather than trusting the previous length.
+        self.recomp_cursor = self.recomp_cursor.wrapping_add(1) % active.len();
+        let dev = &self.devices[active[self.recomp_cursor]];
+
+        // Devices adopted from a kernel without multi-stage compression have no
+        // second rung to promote into.
+        if !recompression_supported(&dev.sysfs_path) {
+            return;
+        }
+
+        recompress_device(
+            &dev.sysfs_path,
+            self.config.recomp_idle_age,
+            &format!("ZramPool: zram{}", dev.id),
+        );
+    }
+
+    /// Seconds between sweeps, so that each device is swept once per
+    /// recomp_interval no matter how many devices the pool currently holds.
+    ///
+    /// Integer division rounds down, so a full cycle lands at or just under the
+    /// interval and no device ever waits longer than it. Sweeps can only fire
+    /// on a monitor tick, so the spacing is quantised to check_interval; with a
+    /// pool large enough for the stride to fall below that, cycles stretch by
+    /// the rounding rather than keeping exactly to the interval.
+    fn recompress_stride(&self) -> u64 {
+        let active = self.active_count().max(1) as u64;
+        (self.config.recomp_interval / active).max(1)
     }
 
     /// Get aggregated stats from all active devices
@@ -1226,10 +1261,10 @@ impl ZramPool {
             // Promotion runs on its own cadence, independent of the (much
             // shorter) pool check interval.
             if !self.config.initial_algorithm.is_empty()
-                && last_recompress.elapsed() >= Duration::from_secs(self.config.recomp_interval)
+                && last_recompress.elapsed() >= Duration::from_secs(self.recompress_stride())
             {
                 last_recompress = Instant::now();
-                self.recompress_all();
+                self.recompress_next();
             }
 
             let stats = match self.get_pool_stats() {
@@ -1642,6 +1677,45 @@ Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority
         );
         assert_eq!((plan.initial.as_str(), plan.initial_level.as_str()), ("zstd", "1"));
         assert_eq!((plan.main.as_str(), plan.main_level.as_str()), ("zstd", "5"));
+    }
+
+    fn stride_for(interval: u64, devices: u64) -> u64 {
+        (interval / devices.max(1)).max(1)
+    }
+
+    /// The guarantee interleaving has to keep is that no device waits longer
+    /// than recomp_interval for a sweep, since that is what bounds promotion
+    /// latency at idle_age + interval. Integer division rounds the stride down,
+    /// so a full cycle lands at or just under the interval, never over.
+    #[test]
+    fn interleaved_cycle_never_exceeds_the_interval() {
+        for interval in [30u64, 60, 120, 600, 3600] {
+            for devices in 1..=8u64 {
+                let cycle = stride_for(interval, devices) * devices;
+                assert!(
+                    cycle <= interval,
+                    "interval={} devices={}: cycle {} would delay a sweep past the interval",
+                    interval,
+                    devices,
+                    cycle
+                );
+                assert!(
+                    cycle > interval - devices,
+                    "interval={} devices={}: cycle {} sweeps wastefully often",
+                    interval,
+                    devices,
+                    cycle
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_stride_never_reaches_zero() {
+        // A pool larger than the interval in seconds must not busy-loop, even
+        // though the clamps make that unreachable (interval >= 30, devices <= 8).
+        assert_eq!(stride_for(4, 8), 1);
+        assert_eq!(stride_for(60, 0), 60);
     }
 
     #[test]
