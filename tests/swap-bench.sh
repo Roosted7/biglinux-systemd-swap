@@ -45,16 +45,32 @@ idx = int(sys.argv[1]); mb = int(sys.argv[2]); rate = float(sys.argv[3])
 random.seed(idx)
 
 MIB = 1024 * 1024
+NOISE = float(os.environ.get("NOISE", "0.25"))
 vocab = [f"token{i:04d}" for i in range(256)]
 
+# A pool of distinct lines, drawn from rather than repeated. Filling a page
+# with one line over and over compresses like a degenerate case (measured at
+# 6x, where real application memory is nearer 3x), which flatters zram and
+# understates how much memory the load actually needs.
+lines = [
+    (" ".join(random.choice(vocab) for _ in range(64)) + "\n").encode()
+    for _ in range(512)
+]
+
 def block():
-    # Exactly one MiB. Building it by repeating a line and trusting the count
-    # to land on a MiB is how the first version silently allocated a sixth of
-    # what it claimed, so the size is truncated to the target rather than
-    # assumed from the arithmetic.
-    line = (" ".join(random.choice(vocab) for _ in range(64)) + "\n").encode()
-    reps = -(-MIB // len(line))
-    return (line * reps)[:MIB]
+    # Exactly one MiB. Truncated to the target rather than trusting a repeat
+    # count to land on it, which is how the first version silently allocated a
+    # sixth of what it claimed.
+    #
+    # NOISE is the incompressible fraction. Text alone compresses far better
+    # than a real working set, so a share of each page is random bytes to bring
+    # the ratio into the range the README describes for desktop workloads.
+    out = bytearray()
+    noise_bytes = int(MIB * NOISE)
+    while len(out) < MIB - noise_bytes:
+        out += random.choice(lines)
+    out = out[: MIB - noise_bytes] + os.urandom(noise_bytes)
+    return bytes(out[:MIB])
 
 pages = [bytearray(block()) for _ in range(mb)]
 # Report what was actually allocated, so a mismatch is visible immediately
@@ -130,6 +146,10 @@ sample() {
 echo "output:   $OUT"
 echo "limits:   MemoryMax=$MEM_MAX MemorySwapMax=$SWAP_MAX"
 echo "load:     $WORKERS workers, ${DURATION}s"
+if [ "$DURATION" -le 600 ]; then
+    echo "note:     promotion needs DURATION well past zram_recomp_idle_age (default 600s)"
+    echo "          or lower that in swap.conf, or the run ends before pages go cold"
+fi
 echo
 
 # Per-worker sizes and rates spread across a range rather than uniform.
