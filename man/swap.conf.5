@@ -67,16 +67,74 @@ Set the ammount of zram devices.
 (IGNORED IF KVER > 4.8, TO BE REMOVED)
 .I
 .IP zram_alg=
-Compressor algorithm for zram, Linux currently supports
+Main compressor for zram: where pages end up and spend most of their life,
+so it is chosen for compression ratio. Linux currently supports
 .BR lzo ,
 .BR lz4 ,
 .BR zstd ,
 .B zlo-rle
 and
 .BR zl4hc .
+See
+.B zram_initial_alg
+for the faster rung pages are staged in first.
 .I
 .IP zram_prio=
 Set the swap priority for zram devices.
+.I
+.IP zram_alg_level=
+Compression level for the main algorithm. Default 3. Empty uses the kernel
+default for that algorithm.
+.I
+.IP zram_initial_alg=
+Initial rung pages are staged in on the way out of RAM, default
+.BR lz4 .
+Pages are compressed by two algorithms with different jobs: the main one
+.RB ( zram_alg )
+is where pages end up and is chosen for ratio, while this faster, weaker one
+keeps a page that is about to be faulted straight back cheap to reach. A page
+left untouched for
+.B zram_recomp_idle_age
+seconds is recompressed into the main algorithm, spending idle CPU on pages
+that are not being touched.
+.sp
+Needs a kernel built with CONFIG_ZRAM_MULTI_COMP. Where that is missing, pages
+are compressed directly with the main algorithm and a warning is logged. Set
+empty to always compress straight into the main algorithm.
+.I
+.IP zram_initial_level=
+Compression level for the initial rung, default 1. For
+.B lz4
+the level is an acceleration factor whose minimum and default are both 1, so
+this changes nothing there; it is set explicitly so that switching the rung to
+.B zstd
+inherits a level suited to a fast rung rather than zstd's own default of 3.
+Set this and
+.B zram_alg_level
+together to stage zstd into denser zstd.
+.I
+.IP zram_recomp_idle_age=
+Seconds a page must go untouched before promotion into the main algorithm.
+Default 600, clamped to 60-86400. Requires CONFIG_ZRAM_TRACK_ENTRY_ACTIME;
+without it the promotion sweep is skipped and a warning is logged.
+.I
+.IP zram_recomp_interval=
+Seconds between promotion sweeps. Default 60, clamped to 30-3600.
+.sp
+A page is promoted between
+.B zram_recomp_idle_age
+and
+.B "zram_recomp_idle_age + zram_recomp_interval"
+seconds after its last access, as it must pass the age check and then wait for
+the next sweep. Keep this well below the age or the age stops meaning much.
+.sp
+Sweeping often does not increase how much recompression happens, since each
+page is promoted once regardless, but it spreads that work into small frequent
+batches instead of one burst per sweep. What it costs is the candidate scan,
+which walks the entry table in proportion to disksize rather than to how much
+of the device is in use, so a very large
+.B zram_size
+is the case for raising this rather than lowering it.
 .PP
 The following options are available in the "swapfc" section:
 .I

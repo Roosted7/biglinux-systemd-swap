@@ -43,7 +43,9 @@ CPU, so one device already compresses on every core in parallel; extra devices
 reduce allocator contention rather than adding parallelism.
 
 Each zram device uses:
-- **Algorithm**: zstd (level 3) — best ratio-to-speed balance
+- **Algorithm**: lz4 on the way in, recompressed to zstd (level 3) once a page
+  has gone 10 minutes untouched — fast to fault back in while hot, dense while
+  cold. Falls back to zstd directly on kernels without `CONFIG_ZRAM_MULTI_COMP`
 - **Disksize**: 150% of RAM (virtual/uncompressed size)
 - **No mem_limit**: prevents write errors that block kernel fallback to disk swap
 - **Priority**: 32767 (maximum — kernel uses zram before disk swap)
@@ -231,7 +233,8 @@ systemd-swap (Rust daemon)
 Memory pressure (free RAM < threshold)
   → MGLRU protects working set (pages < 1s old)
   → Kernel swaps cold anonymous pages:
-      ├─ zram: compress with zstd level 3 → store in RAM
+      ├─ zram: compress with lz4 → store in RAM
+      │   ├─ Idle 10 min → daemon recompresses the page to zstd level 3
       │   ├─ Pool utilization > 85% → daemon adds zram device
       │   └─ All disksize consumed → kernel falls back to swapfiles
       └─ zswap: compress in kernel pool → shrinker writes back to disk

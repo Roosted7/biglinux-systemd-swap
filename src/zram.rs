@@ -66,6 +66,158 @@ fn configure_zram_algorithm(sysfs: &str, comp_alg: &str, ctx: &str) {
     }
 }
 
+/// Build the recomp_algorithm value registering the promotion target.
+///
+/// Priority 1 is the first slot after comp_algorithm (priority 0).
+fn recomp_algorithm_spec(alg: &str) -> String {
+    format!("algo={} priority=1", alg)
+}
+
+/// Build the algorithm_params value setting the level of comp_algorithm.
+fn primary_params_spec(alg: &str, level: &str) -> String {
+    format!("algo={} level={}", alg, level)
+}
+
+/// Build the algorithm_params value setting the level of the promotion target.
+///
+/// The priority must be repeated here: algorithm_params_store defaults it to
+/// ZRAM_PRIMARY_COMP, so without it the level lands on comp_algorithm instead.
+fn recomp_params_spec(alg: &str, level: &str) -> String {
+    format!("algo={} level={} priority=1", alg, level)
+}
+
+/// Whether the kernel exposes multi-stage compression (CONFIG_ZRAM_MULTI_COMP).
+fn recompression_supported(sysfs: &str) -> bool {
+    Path::new(&format!("{}/recomp_algorithm", sysfs)).exists()
+}
+
+/// How one device's compression rungs are laid out.
+#[derive(Debug, PartialEq, Eq)]
+struct CompressionPlan {
+    /// Algorithm pages are first compressed with, written to comp_algorithm.
+    initial: String,
+    /// Level for `initial`; empty leaves the kernel default.
+    initial_level: String,
+    /// Algorithm idle pages are promoted into, registered at priority 1.
+    /// Empty when there is no second rung and `initial` is already the main one.
+    main: String,
+    /// Level for `main`.
+    main_level: String,
+}
+
+/// Decide the compression rungs for a device.
+///
+/// With a second rung, pages are staged in the fast `initial_alg` and promoted
+/// into `main_alg` once idle. Without one -- no initial algorithm configured,
+/// or a kernel that cannot recompress -- pages go straight into `main_alg`,
+/// which is what zram did before multi-stage compression existed.
+fn plan_compression(
+    sysfs: &str,
+    main_alg: &str,
+    main_level: &str,
+    initial_alg: &str,
+    initial_level: &str,
+    ctx: &str,
+) -> CompressionPlan {
+    // Without a second rung the main algorithm takes the comp_algorithm slot,
+    // and initial_level belongs to an algorithm that is never used.
+    let single_rung = CompressionPlan {
+        initial: main_alg.to_string(),
+        initial_level: main_level.to_string(),
+        main: String::new(),
+        main_level: String::new(),
+    };
+
+    if initial_alg.is_empty() {
+        return single_rung;
+    }
+
+    if !recompression_supported(sysfs) {
+        warn!(
+            "{}: kernel lacks CONFIG_ZRAM_MULTI_COMP, compressing with {} directly \
+             instead of staging in {}",
+            ctx, main_alg, initial_alg
+        );
+        return single_rung;
+    }
+
+    CompressionPlan {
+        initial: initial_alg.to_string(),
+        initial_level: initial_level.to_string(),
+        main: main_alg.to_string(),
+        main_level: main_level.to_string(),
+    }
+}
+
+/// Apply a compression plan. Must run before disksize is set: the kernel
+/// rejects both comp_algorithm and recomp_algorithm once a device is live.
+fn configure_zram_compression(sysfs: &str, plan: &CompressionPlan, ctx: &str) {
+    configure_zram_algorithm(sysfs, &plan.initial, ctx);
+
+    let params_path = format!("{}/algorithm_params", sysfs);
+    let params_exist = Path::new(&params_path).exists();
+
+    if !plan.initial_level.is_empty() && params_exist {
+        let spec = primary_params_spec(&plan.initial, &plan.initial_level);
+        if let Err(e) = std::fs::write(&params_path, spec) {
+            warn!(
+                "{}: failed to set {} level={}: {}",
+                ctx, plan.initial, plan.initial_level, e
+            );
+        }
+    }
+
+    if plan.main.is_empty() {
+        info!("{}: compressing with {}", ctx, plan.initial);
+        return;
+    }
+
+    let recomp_path = format!("{}/recomp_algorithm", sysfs);
+    if let Err(e) = std::fs::write(&recomp_path, recomp_algorithm_spec(&plan.main)) {
+        warn!(
+            "{}: failed to register {} for recompression: {}",
+            ctx, plan.main, e
+        );
+        return;
+    }
+
+    if !plan.main_level.is_empty() && params_exist {
+        let spec = recomp_params_spec(&plan.main, &plan.main_level);
+        if let Err(e) = std::fs::write(&params_path, spec) {
+            warn!(
+                "{}: failed to set {} level={}: {}",
+                ctx, plan.main, plan.main_level, e
+            );
+        }
+    }
+
+    info!(
+        "{}: staging in {}, promoting idle pages to {}",
+        ctx, plan.initial, plan.main
+    );
+}
+
+/// Mark pages untouched for `idle_age` seconds as idle, then recompress them.
+///
+/// Age-based marking needs CONFIG_ZRAM_TRACK_ENTRY_ACTIME. Without it the
+/// kernel only accepts "all", which would rescan the whole device on every
+/// pass, so this reports the gap and does nothing rather than burning CPU.
+fn recompress_device(sysfs: &str, idle_age: u64, ctx: &str) {
+    let idle_path = format!("{}/idle", sysfs);
+    if let Err(e) = std::fs::write(&idle_path, idle_age.to_string()) {
+        warn!(
+            "{}: cannot mark pages idle by age ({}), skipping recompression. \
+             Kernel likely lacks CONFIG_ZRAM_TRACK_ENTRY_ACTIME.",
+            ctx, e
+        );
+        return;
+    }
+
+    if let Err(e) = std::fs::write(format!("{}/recompress", sysfs), "type=idle") {
+        warn!("{}: recompression pass failed: {}", ctx, e);
+    }
+}
+
 /// Start zram swap
 pub fn start(config: &Config) -> Result<()> {
     crate::systemd::notify_status("Setting up Zram...");
@@ -108,7 +260,19 @@ pub fn start(config: &Config) -> Result<()> {
     let zram_sysfs = format!("/sys/block/zram{}", new_id);
     info!("Zram: initialized: {}", zram_dev);
 
-    configure_zram_algorithm(&zram_sysfs, zram_alg, "Zram");
+    let plan = plan_compression(
+        &zram_sysfs,
+        zram_alg,
+        config.get("zram_alg_level").unwrap_or(defaults::ZRAM_ALG_LEVEL),
+        config
+            .get("zram_initial_alg")
+            .unwrap_or(defaults::ZRAM_INITIAL_ALG),
+        config
+            .get("zram_initial_level")
+            .unwrap_or(defaults::ZRAM_INITIAL_LEVEL),
+        "Zram",
+    );
+    configure_zram_compression(&zram_sysfs, &plan, "Zram");
 
     let disksize_path = format!("{}/disksize", zram_sysfs);
     if let Err(e) = std::fs::write(&disksize_path, zram_size.to_string()) {
@@ -270,8 +434,10 @@ pub struct ZramPoolConfig {
     pub max_devices: u8,
     /// Initial ZRAM size as percentage of RAM (first device)
     pub initial_size_percent: u32,
-    /// Compression algorithm
+    /// Main algorithm: where pages end up and spend most of their life
     pub algorithm: String,
+    /// Level for the main algorithm (empty = kernel default)
+    pub algorithm_level: String,
     /// Swap priority (all devices same = round-robin)
     pub priority: i32,
     /// Minimum compression ratio to allow pool expansion
@@ -290,6 +456,14 @@ pub struct ZramPoolConfig {
     pub min_free_ram_percent: u8,
     /// Seconds between monitor checks
     pub check_interval: u64,
+    /// Initial rung pages are staged in (empty = straight into the main one)
+    pub initial_algorithm: String,
+    /// Level for the initial rung (empty = kernel default)
+    pub initial_level: String,
+    /// Pages idle this long (seconds) are promoted into the main algorithm
+    pub recomp_idle_age: u64,
+    /// Seconds between promotion passes
+    pub recomp_interval: u64,
 }
 
 impl ZramPoolConfig {
@@ -305,6 +479,10 @@ impl ZramPoolConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50),
             algorithm: config.get("zram_alg").unwrap_or(defaults::ZRAM_ALG).to_string(),
+            algorithm_level: config
+                .get("zram_alg_level")
+                .unwrap_or(defaults::ZRAM_ALG_LEVEL)
+                .to_string(),
             priority: config.get_as("zram_prio").unwrap_or(defaults::ZRAM_PRIO),
             expand_min_ratio: config
                 .get_as::<f64>("zram_expand_min_ratio")
@@ -339,6 +517,22 @@ impl ZramPoolConfig {
                 .and_then(|s| s.strip_suffix('%'))
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+            initial_algorithm: config
+                .get("zram_initial_alg")
+                .unwrap_or(defaults::ZRAM_INITIAL_ALG)
+                .to_string(),
+            initial_level: config
+                .get("zram_initial_level")
+                .unwrap_or(defaults::ZRAM_INITIAL_LEVEL)
+                .to_string(),
+            recomp_idle_age: config
+                .get_as::<u64>("zram_recomp_idle_age")
+                .unwrap_or(defaults::ZRAM_RECOMP_IDLE_AGE)
+                .clamp(60, 86400),
+            recomp_interval: config
+                .get_as::<u64>("zram_recomp_interval")
+                .unwrap_or(defaults::ZRAM_RECOMP_INTERVAL)
+                .clamp(30, 3600),
         }
     }
 }
@@ -584,21 +778,18 @@ impl ZramPool {
         let sysfs_path = format!("/sys/block/zram{}", new_id);
         let dev_path = format!("/dev/zram{}", new_id);
 
-        // Set comp algorithm BEFORE disksize (kernel 6.1+ requires this order)
+        // All compression setup happens BEFORE disksize (kernel 6.1+ requires
+        // this order and rejects the attributes once the device is live).
         let ctx = format!("ZramPool: zram{}", new_id);
-        configure_zram_algorithm(
+        let plan = plan_compression(
             &sysfs_path,
             &self.config.algorithm,
+            &self.config.algorithm_level,
+            &self.config.initial_algorithm,
+            &self.config.initial_level,
             &ctx,
         );
-
-        // Set algorithm_params before disksize for proper initialization
-        if self.config.algorithm == "zstd" {
-            let params_path = format!("{}/algorithm_params", sysfs_path);
-            if Path::new(&params_path).exists() {
-                let _ = std::fs::write(&params_path, "level=3");
-            }
-        }
+        configure_zram_compression(&sysfs_path, &plan, &ctx);
 
         // Set disksize
         let disksize_path = format!("{}/disksize", sysfs_path);
@@ -678,6 +869,26 @@ impl ZramPool {
             .iter()
             .filter(|d| d.state == ZramDeviceState::Active)
             .count()
+    }
+
+    /// Promote idle pages into the main algorithm on every active device.
+    fn recompress_all(&self) {
+        for dev in self
+            .devices
+            .iter()
+            .filter(|d| d.state == ZramDeviceState::Active)
+        {
+            // Devices adopted from a kernel without multi-stage compression
+            // have no second rung to promote into.
+            if !recompression_supported(&dev.sysfs_path) {
+                continue;
+            }
+            recompress_device(
+                &dev.sysfs_path,
+                self.config.recomp_idle_age,
+                &format!("ZramPool: zram{}", dev.id),
+            );
+        }
     }
 
     /// Get aggregated stats from all active devices
@@ -1003,12 +1214,22 @@ impl ZramPool {
 
         let check_interval = self.config.check_interval;
         let mut log_counter: u64 = 0;
+        let mut last_recompress = Instant::now();
 
         loop {
             thread::sleep(Duration::from_secs(check_interval));
 
             if crate::stop_in_progress() {
                 break;
+            }
+
+            // Promotion runs on its own cadence, independent of the (much
+            // shorter) pool check interval.
+            if !self.config.initial_algorithm.is_empty()
+                && last_recompress.elapsed() >= Duration::from_secs(self.config.recomp_interval)
+            {
+                last_recompress = Instant::now();
+                self.recompress_all();
             }
 
             let stats = match self.get_pool_stats() {
@@ -1334,6 +1555,128 @@ Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority
         assert_eq!(pc.max_devices, defaults::ZRAM_MAX_DEVICES);
         assert_eq!(pc.algorithm, defaults::ZRAM_ALG);
         assert_eq!(pc.priority, defaults::ZRAM_PRIO);
+    }
+
+    // ── Compression rungs ────────────────────────────────────────────────────
+
+    #[test]
+    fn algorithm_param_specs() {
+        assert_eq!(primary_params_spec("zstd", "3"), "algo=zstd level=3");
+        assert_eq!(recomp_algorithm_spec("zstd"), "algo=zstd priority=1");
+        // priority must be repeated, else the level lands on comp_algorithm
+        assert_eq!(
+            recomp_params_spec("zstd", "5"),
+            "algo=zstd level=5 priority=1"
+        );
+    }
+
+    /// Fake sysfs directory; `multi_comp` controls whether the kernel is
+    /// pretending to support recompression.
+    fn fake_sysfs(multi_comp: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("comp_algorithm"), "").unwrap();
+        std::fs::write(dir.path().join("algorithm_params"), "").unwrap();
+        if multi_comp {
+            std::fs::write(dir.path().join("recomp_algorithm"), "").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn plan_stages_in_initial_when_kernel_supports_it() {
+        let dir = fake_sysfs(true);
+        let plan = plan_compression(
+            dir.path().to_str().unwrap(),
+            "zstd",
+            "3",
+            "lz4",
+            "",
+            "test",
+        );
+        assert_eq!(plan.initial, "lz4");
+        assert_eq!(plan.initial_level, "");
+        assert_eq!(plan.main, "zstd");
+        assert_eq!(plan.main_level, "3");
+    }
+
+    #[test]
+    fn plan_falls_back_to_main_without_multi_comp() {
+        let dir = fake_sysfs(false);
+        let plan = plan_compression(
+            dir.path().to_str().unwrap(),
+            "zstd",
+            "3",
+            "lz4",
+            "",
+            "test",
+        );
+        // Identical to pre-multi-stage behaviour: main algorithm, its level,
+        // and nothing to promote into.
+        assert_eq!(plan.initial, "zstd");
+        assert_eq!(plan.initial_level, "3");
+        assert_eq!(plan.main, "");
+        assert_eq!(plan.main_level, "");
+    }
+
+    #[test]
+    fn plan_without_initial_alg_uses_main_directly() {
+        let dir = fake_sysfs(true);
+        let plan =
+            plan_compression(dir.path().to_str().unwrap(), "zstd", "3", "", "", "test");
+        assert_eq!(plan.initial, "zstd");
+        assert_eq!(plan.initial_level, "3");
+        assert_eq!(plan.main, "");
+    }
+
+    #[test]
+    fn plan_keeps_distinct_levels_per_rung() {
+        // zstd staging into zstd at a denser level
+        let dir = fake_sysfs(true);
+        let plan = plan_compression(
+            dir.path().to_str().unwrap(),
+            "zstd",
+            "5",
+            "zstd",
+            "1",
+            "test",
+        );
+        assert_eq!((plan.initial.as_str(), plan.initial_level.as_str()), ("zstd", "1"));
+        assert_eq!((plan.main.as_str(), plan.main_level.as_str()), ("zstd", "5"));
+    }
+
+    #[test]
+    fn pool_config_rung_defaults() {
+        let pc = ZramPoolConfig::from_config(&cfg_from(&[]));
+        assert_eq!(pc.algorithm, defaults::ZRAM_ALG);
+        assert_eq!(pc.algorithm_level, defaults::ZRAM_ALG_LEVEL);
+        assert_eq!(pc.initial_algorithm, defaults::ZRAM_INITIAL_ALG);
+        assert_eq!(pc.initial_level, defaults::ZRAM_INITIAL_LEVEL);
+        assert_eq!(pc.recomp_idle_age, defaults::ZRAM_RECOMP_IDLE_AGE);
+        assert_eq!(pc.recomp_interval, defaults::ZRAM_RECOMP_INTERVAL);
+    }
+
+    #[test]
+    fn pool_config_initial_rung_can_be_disabled() {
+        let pc = ZramPoolConfig::from_config(&cfg_from(&[("zram_initial_alg", "")]));
+        assert_eq!(pc.initial_algorithm, "");
+    }
+
+    #[test]
+    fn pool_config_recomp_idle_age_clamps_to_60_86400() {
+        let cfg = cfg_from(&[("zram_recomp_idle_age", "1")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).recomp_idle_age, 60);
+
+        let cfg = cfg_from(&[("zram_recomp_idle_age", "999999")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).recomp_idle_age, 86400);
+    }
+
+    #[test]
+    fn pool_config_recomp_interval_clamps_to_30_3600() {
+        let cfg = cfg_from(&[("zram_recomp_interval", "1")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).recomp_interval, 30);
+
+        let cfg = cfg_from(&[("zram_recomp_interval", "99999")]);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).recomp_interval, 3600);
     }
 
     #[test]

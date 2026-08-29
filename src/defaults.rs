@@ -8,7 +8,24 @@
 // ── Zram ─────────────────────────────────────────────────────────────────────
 
 pub const ZRAM_SIZE: &str = "125%";
+
+// Main algorithm: where pages end up and spend most of their life. Chosen for
+// compression ratio, since most of what sits in zram is cold.
 pub const ZRAM_ALG: &str = "zstd";
+pub const ZRAM_ALG_LEVEL: &str = "3";
+
+// Initial algorithm: a faster, weaker rung pages are staged in on the way in,
+// so a page that is about to be faulted straight back is cheap to reach. Once
+// a page has stayed idle it is recompressed into the main algorithm.
+//
+// Only used where the kernel supports multi-stage compression; otherwise pages
+// go directly into the main algorithm. Empty disables the rung outright.
+pub const ZRAM_INITIAL_ALG: &str = "lz4";
+// For lz4 the level is an acceleration factor, and 1 is both the minimum the
+// backend accepts and its default, so this is a no-op there. It is spelled out
+// rather than left empty so that swapping the rung to zstd inherits a level
+// suited to a fast rung instead of zstd's default of 3.
+pub const ZRAM_INITIAL_LEVEL: &str = "1";
 pub const ZRAM_PRIO: i32 = 32767;
 pub const ZRAM_MAX_DEVICES: u8 = 8;
 pub const ZRAM_EXPAND_THRESHOLD: u8 = 85;
@@ -18,6 +35,22 @@ pub const ZRAM_CONTRACT_STABILITY: u64 = 120;
 pub const ZRAM_MIN_FREE_RAM: u8 = 15;
 pub const ZRAM_CHECK_INTERVAL: u64 = 5;
 pub const ZRAM_EXPAND_MIN_RATIO: f64 = 2.0;
+
+// Promotion of pages out of the initial rung into the main algorithm.
+//
+// A page is promoted between IDLE_AGE and IDLE_AGE + INTERVAL after its last
+// access, since it has to survive the age check and then wait for the next
+// sweep. The interval is therefore kept well below the age, so the age roughly
+// means what it says: here, promotion lands between 10 and 11 minutes.
+//
+// Sweeping often is the cheap end of the trade. It does not change how much
+// recompression happens, as each page is promoted exactly once either way, but
+// it spreads that work into small frequent batches rather than one burst per
+// sweep, and the burst is what a desktop notices. What it does cost is the
+// candidate scan, which walks the entry table in proportion to disksize rather
+// than to how much of the device is in use.
+pub const ZRAM_RECOMP_IDLE_AGE: u64 = 600;
+pub const ZRAM_RECOMP_INTERVAL: u64 = 60;
 
 // ── Zswap ────────────────────────────────────────────────────────────────────
 
