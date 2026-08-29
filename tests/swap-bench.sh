@@ -9,9 +9,13 @@
 #
 # Workers differ in working-set size and access rate rather than all hammering
 # equally, because a uniform load never produces the mix of hot and cold pages
-# the recompression rungs exist to exploit. A separate low-memory canary times
-# how long its own pages take to come back, which is the closest thing to a
-# responsiveness number available without instrumenting the desktop.
+# the recompression rungs exist to exploit. A small canary runs alongside them
+# inside the same cgroup and times its own accesses, which is the closest thing
+# to a responsiveness number available without instrumenting the desktop.
+#
+# Swap is read from the cgroup rather than /proc/vmstat. System-wide counters
+# include whatever the desktop already has in zram, which on a machine with
+# gigabytes of it drowns out the load entirely.
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -40,11 +44,22 @@ import os, sys, time, random
 idx = int(sys.argv[1]); mb = int(sys.argv[2]); rate = float(sys.argv[3])
 random.seed(idx)
 
+MIB = 1024 * 1024
 vocab = [f"token{i:04d}" for i in range(256)]
+
 def block():
-    return (" ".join(random.choice(vocab) for _ in range(64)) + "\n").encode() * 256
+    # Exactly one MiB. Building it by repeating a line and trusting the count
+    # to land on a MiB is how the first version silently allocated a sixth of
+    # what it claimed, so the size is truncated to the target rather than
+    # assumed from the arithmetic.
+    line = (" ".join(random.choice(vocab) for _ in range(64)) + "\n").encode()
+    reps = -(-MIB // len(line))
+    return (line * reps)[:MIB]
 
 pages = [bytearray(block()) for _ in range(mb)]
+# Report what was actually allocated, so a mismatch is visible immediately
+# instead of looking like a workload that simply refuses to swap.
+print(f"worker {idx}: {len(pages) * MIB / MIB:.0f} MiB resident", flush=True)
 
 # Tiered access: a small hot set touched constantly, a warm set occasionally,
 # and a cold remainder left alone so it can actually age into the idle rung.
@@ -81,11 +96,23 @@ print(f"canary_ms p50={pct(0.50):.2f} p90={pct(0.90):.2f} p99={pct(0.99):.2f} n=
 PY
 
 # ── Sampling ────────────────────────────────────────────────────────────────
+# The scope's own cgroup, so memory and swap are the load's rather than the
+# machine's. Falls back to a search in case the slice is not the expected one.
+find_cgroup() {
+    local n="swap-bench-$$.scope"
+    for base in /sys/fs/cgroup/system.slice /sys/fs/cgroup/user.slice; do
+        [ -d "$base/$n" ] && { echo "$base/$n"; return; }
+    done
+    find /sys/fs/cgroup -maxdepth 5 -name "$n" -type d 2>/dev/null | head -1
+}
+
 sample() {
     local t=$1
-    local pswpin pswpout psi_some psi_full
+    local pswpin pswpout psi_some psi_full cg_mem cg_swap
     pswpin=$(awk '/^pswpin /{print $2}' /proc/vmstat)
     pswpout=$(awk '/^pswpout /{print $2}' /proc/vmstat)
+    cg_mem=$(cat "$CGROUP/memory.current" 2>/dev/null || echo 0)
+    cg_swap=$(cat "$CGROUP/memory.swap.current" 2>/dev/null || echo 0)
     psi_some=$(awk -F'total=' '/^some/{print $2}' /proc/pressure/memory)
     psi_full=$(awk -F'total=' '/^full/{print $2}' /proc/pressure/memory)
 
@@ -97,7 +124,7 @@ sample() {
         orig=$((orig+o)); compr=$((compr+c)); used=$((used+m))
     done
 
-    echo "$t $pswpin $pswpout $psi_some $psi_full $orig $compr $used" >> "$OUT/samples.tsv"
+    echo "$t $pswpin $pswpout $psi_some $psi_full $orig $compr $used $cg_mem $cg_swap" >> "$OUT/samples.tsv"
 }
 
 echo "output:   $OUT"
@@ -111,22 +138,40 @@ import re
 s='$MEM_MAX'; n=int(re.sub('[^0-9]','',s)); print(int(n*1024*1.5))")
 PER=$(( TOTAL_MB / WORKERS ))
 
-echo "t pswpin pswpout psi_some psi_full zram_orig zram_compr zram_used" > "$OUT/samples.tsv"
+echo "t pswpin pswpout psi_some psi_full zram_orig zram_compr zram_used cg_mem cg_swap" > "$OUT/samples.tsv"
 
+# The canary runs inside the scope with the load. Outside it, on a machine with
+# tens of gigabytes free, its pages never leave RAM and its latency measures
+# nothing. Inside, it is a small process competing with the pressure, which is
+# the thing worth timing.
 systemd-run --quiet --scope --collect \
     -p MemoryMax="$MEM_MAX" -p MemorySwapMax="$SWAP_MAX" \
     --unit="swap-bench-$$" \
     bash -c '
+        python3 '"$OUT"'/canary.py '"$DURATION"' > '"$OUT"'/canary.txt &
         for i in $(seq 1 '"$WORKERS"'); do
             rate=$(python3 -c "print(0.001 * (1 + $i % 4))")
             python3 '"$OUT"'/worker.py $i '"$PER"' $rate &
         done
         wait
-    ' &
+    ' > "$OUT/workers.log" 2>&1 &
 SCOPE_PID=$!
 
-python3 "$OUT/canary.py" "$DURATION" > "$OUT/canary.txt" &
-CANARY_PID=$!
+# Give the workers time to allocate, then confirm the load is the size asked
+# for. A load that quietly allocates a fraction of its target produces a clean
+# run with nothing in it.
+sleep 30
+echo "--- allocation ---"
+cat "$OUT/workers.log" 2>/dev/null | head -n "$WORKERS"
+resident=$(ps -o rss= -C python3 2>/dev/null | awk '{s+=$1} END {print int(s/1024)}')
+echo "resident total: ${resident}MB   target: ${TOTAL_MB}MB   ceiling: $MEM_MAX"
+CGROUP="$(find_cgroup)"
+if [ -n "$CGROUP" ]; then
+    echo "cgroup:  $CGROUP"
+else
+    echo "cgroup:  not found - cg_swap will read 0, swap numbers will be system-wide"
+fi
+echo
 
 for ((t=0; t<DURATION; t+=SAMPLE)); do
     sample "$t"
@@ -135,7 +180,6 @@ done
 
 kill "$SCOPE_PID" 2>/dev/null || true
 systemctl stop "swap-bench-$$.scope" 2>/dev/null || true
-wait "$CANARY_PID" 2>/dev/null || true
 
 # ── Report ──────────────────────────────────────────────────────────────────
 echo
@@ -151,6 +195,11 @@ print(f"swap_out  {(int(l[2])-int(f[2]))*4096/2**20/dt:.1f} MB/s")
 print(f"swap_in   {(int(l[1])-int(f[1]))*4096/2**20/dt:.1f} MB/s")
 print(f"psi_some  {(int(l[3])-int(f[3]))/1e6/dt*100:.2f}% of wall")
 print(f"psi_full  {(int(l[4])-int(f[4]))/1e6/dt*100:.2f}% of wall")
+if len(l) > 9:
+    peak_swap = max(int(r[9]) for r in rows if len(r) > 9)
+    peak_mem  = max(int(r[8]) for r in rows if len(r) > 8)
+    print(f"cg_mem    {peak_mem/2**30:.2f} GiB peak")
+    print(f"cg_swap   {peak_swap/2**30:.2f} GiB peak  <- the load's own swap")
 peak=max(rows,key=lambda r:int(r[6]))
 o,c,u=int(peak[5]),int(peak[6]),int(peak[7])
 if c:
