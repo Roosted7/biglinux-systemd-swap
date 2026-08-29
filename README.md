@@ -32,10 +32,15 @@ In `auto` mode, the daemon checks:
 The daemon manages a **dynamic pool of zram devices** that expands and
 contracts based on demand:
 
-- **Initial pool**: one device per CPU core (max 8 devices)
-- **Expansion**: adds a device when pool utilization exceeds 85%
+- **Initial pool**: 4 devices, splitting the configured disksize evenly
+- **Expansion**: adds a device when pool utilization exceeds 85%, up to
+  `zram_max_devices` (default 8)
 - **Contraction**: removes idle devices when utilization drops below 20% for 120s
 - **Monitoring interval**: 5 seconds
+
+Pool size is not derived from CPU count. zram allocates compression streams per
+CPU, so one device already compresses on every core in parallel; extra devices
+reduce allocator contention rather than adding parallelism.
 
 Each zram device uses:
 - **Algorithm**: zstd (level 3) — best ratio-to-speed balance
