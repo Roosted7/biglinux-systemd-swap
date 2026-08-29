@@ -197,13 +197,36 @@ run_one() {
         losetup -d "$lo"; rm -f "$img"; return 0
     fi
 
+    local prev=-1
     for pct in $FILL_STEPS; do
         fill_to "$mp" "$pct"
         local actual
         actual=$(df --output=pcent "$mp" | tail -1 | tr -d ' %')
+        # Once the filesystem is full, further steps ask for nothing and only
+        # repeat the same line.
+        if [ "$actual" = "$prev" ] && [ "$actual" -ge 99 ]; then continue; fi
+        prev=$actual
         printf '%-6s %3sG  want%3s%% got%3s%%  ' "$fstype" "$size_gb" "$pct" "$actual"
         "$SPACECHECK" "$mp" "$CHUNK" 2>/dev/null || echo "spacecheck failed"
     done
+
+    # Fill then delete, without balancing. This is the state the btrfs
+    # unallocated check exists for and the one monotonic filling cannot reach:
+    # chunks stay allocated after the data goes away, so free space returns
+    # while unallocated does not. df looks healthy, metadata cannot grow.
+    # On ext4 and xfs the space simply comes back and this should allow again,
+    # which is the contrast worth seeing.
+    local n=0
+    for f in "$mp"/ballast/*; do
+        [ -f "$f" ] || continue
+        n=$(( n + 1 ))
+        [ $(( n % 2 )) -eq 0 ] && rm -f "$f"
+    done
+    sync
+    local after
+    after=$(df --output=pcent "$mp" | tail -1 | tr -d ' %')
+    printf '%-6s %3sG  deleted half  (%3s%%)  ' "$fstype" "$size_gb" "$after"
+    "$SPACECHECK" "$mp" "$CHUNK" 2>/dev/null || echo "spacecheck failed"
 
     umount "$mp"
     losetup -d "$lo"
