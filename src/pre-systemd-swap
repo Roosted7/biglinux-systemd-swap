@@ -42,6 +42,23 @@ if [[ -z "$swapfcfolder" ]]; then
     swapfcfolder="swapfile"
 fi
 
+# Only zram and disabled never create swap files. auto is resolved by the
+# daemon at runtime, so treat it as needing the subvolume.
+swap_mode=$(grep -E "^swap_mode=" "$CONFIG_FILE" \
+    | tail -n 1 \
+    | cut -d'=' -f2 \
+    | cut -d'#' -f1 \
+    | tr -d '[:space:]' || true)
+
+if [[ -z "$swap_mode" ]]; then
+    swap_mode="auto"
+fi
+
+case "$swap_mode" in
+    zram|disabled) swapfile_subvol_needed=0 ;;
+    *)             swapfile_subvol_needed=1 ;;
+esac
+
 # =============================================================================
 # System Detection
 # =============================================================================
@@ -66,7 +83,9 @@ fi
 # Btrfs Subvolume Setup
 # =============================================================================
 
-if [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
+if [[ "$swapfile_subvol_needed" != "1" ]] && [[ "$fstype" == "btrfs" ]]; then
+    log_info "swap_mode=$swap_mode does not use swap files, skipping subvolume setup"
+elif [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
     log_info "Setting up btrfs subvolume for swap files"
 
     # Mount the btrfs top level on /mnt. Plain `mount "$rootpartition"` gives
