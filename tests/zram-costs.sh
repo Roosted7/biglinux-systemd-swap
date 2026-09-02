@@ -98,7 +98,9 @@ if [ "$(echo "$total_gb > 0" | bc)" -eq 1 ]; then
     # What the cadence actually costs, which is the number the interval default
     # should be argued from rather than an assumption.
     for iv in 30 60 120 300 600; do
-        pct=$(echo "scale=3; ($sweep + $total_compact) / ($iv * 1000) * 100" | bc)
+        # Multiply before dividing: bc truncates at the given scale as it goes,
+        # so dividing first collapses a sub-percent result to zero.
+        pct=$(echo "scale=4; ($sweep + $total_compact) * 100 / ($iv * 1000)" | bc)
         printf '  interval=%-4ss -> %s%% of one core\n' "$iv" "$pct"
     done
     echo
