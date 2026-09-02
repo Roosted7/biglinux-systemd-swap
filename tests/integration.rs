@@ -66,7 +66,7 @@ fn auto_injected_config_feeds_zram_pool() {
     cfg.apply_autoconfig(&RecommendedConfig::default());
     let pool = ZramPoolConfig::from_config(&cfg);
     assert_eq!(pool.algorithm, "zstd");
-    assert_eq!(pool.initial_size_percent, 150);
+    assert_eq!(pool.total_size_percent, 150);
 }
 
 // ── Autoconfig → SwapFileConfig pipeline ─────────────────────────────────────

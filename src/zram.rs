@@ -13,7 +13,7 @@ use crate::config::{Config, WORK_DIR};
 use crate::defaults;
 use crate::helpers::{makedirs, parse_size, read_file};
 use crate::systemd::{gen_swap_unit, systemctl, SystemctlAction};
-use crate::{error, info, warn};
+use crate::{debug, error, info, warn};
 
 const ZRAM_MODULE: &str = "/sys/module/zram";
 const ZRAM_HOT_ADD: &str = "/sys/class/zram-control/hot_add";
@@ -84,6 +84,117 @@ fn primary_params_spec(alg: &str, level: &str) -> String {
 /// ZRAM_PRIMARY_COMP, so without it the level lands on comp_algorithm instead.
 fn recomp_params_spec(alg: &str, level: &str) -> String {
     format!("algo={} level={} priority=1", alg, level)
+}
+
+/// Read a "N%" config value, falling back to the default when absent or
+/// malformed. Both sizing keys are percentages of RAM, so they parse alike.
+fn percent_of_ram(config: &Config, key: &str, fallback: &str) -> u32 {
+    config
+        .get_opt(key)
+        .or(Some(fallback))
+        .and_then(|s| s.trim().strip_suffix('%'))
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(50)
+}
+
+/// Consecutive sweeps a device may skip for CPU load before running anyway, so
+/// a permanently busy machine still gets its pages promoted.
+const MAX_SWEEP_DEFERRALS: u32 = 10;
+
+/// Why a promotion sweep did or did not run.
+#[derive(Debug, PartialEq, Eq)]
+enum SweepVerdict {
+    Run,
+    /// Not enough written since the last sweep to pay for walking the table
+    TooLittle(u64),
+    /// Written recently enough that none of it can have aged out yet
+    TooYoung,
+    /// CPU is contended and there is RAM headroom to wait with
+    Defer,
+}
+
+/// How a pool is laid out: how many devices it may hold and how big each is.
+#[derive(Debug, PartialEq, Eq)]
+struct PoolLayout {
+    max_devices: u32,
+    device_size: u64,
+}
+
+/// Work out the pool layout from the total ceiling and a nominal device size.
+///
+/// Devices are a fixed size and the pool grows by adding them, rather than by
+/// making them bigger. That keeps the promotion sweep's per-device cost
+/// constant as the pool grows: a sweep costs roughly 8ms per GB of disksize, so
+/// a 25%-of-RAM device is about the same number of milliseconds whether the
+/// pool holds two of them or six.
+///
+/// When the ceiling divided by the nominal size needs more devices than the cap
+/// allows, the ceiling wins and the devices get bigger. zram_size is the number
+/// an admin sets deliberately; zram_device_size is a chunking hint.
+fn plan_pool(total: u64, nominal_device: u64, hard_cap: u32) -> PoolLayout {
+    let nominal = nominal_device.max(1);
+    let hard_cap = hard_cap.max(1);
+
+    // Ceiling division, spelled out rather than div_ceil to keep the 1.70
+    // minimum the README states.
+    let wanted = ((total + nominal - 1) / nominal).max(1);
+
+    if wanted <= hard_cap as u64 {
+        PoolLayout {
+            max_devices: wanted as u32,
+            device_size: nominal,
+        }
+    } else {
+        let per = (total + hard_cap as u64 - 1) / hard_cap as u64;
+        PoolLayout {
+            max_devices: hard_cap,
+            device_size: per,
+        }
+    }
+}
+
+/// Size of the device at `index`, so a pool never exceeds its ceiling.
+///
+/// The last device takes whatever is left rather than a full share, since the
+/// ceiling and the device size need not divide evenly. Returns 0 once the
+/// ceiling is used up, which is the caller's signal to stop.
+fn device_size_at(total: u64, device_size: u64, index: u32) -> u64 {
+    let used = device_size.saturating_mul(index as u64);
+    if used >= total {
+        0
+    } else {
+        device_size.min(total - used)
+    }
+}
+
+/// Sectors written to a device since it was created, from the block layer.
+///
+/// mm_stat's stored size is not a write counter: a workload that frees and
+/// rewrites the same amount leaves it unchanged while every page is new, which
+/// is exactly the churn a promotion sweep exists to handle.
+///
+/// Promotion is background work with no deadline, so it can wait for a quieter
+/// moment. cpu_pressure uses PSI rather than loadavg: loadavg counts runnable
+/// tasks over minutes, while this is the share of the last ten seconds spent
+/// waiting for CPU, which is what "busy right now" means.
+fn sectors_written(sysfs: &str) -> Option<u64> {
+    std::fs::read_to_string(format!("{}/stat", sysfs))
+        .ok()?
+        .split_whitespace()
+        .nth(6)?
+        .parse()
+        .ok()
+}
+
+/// Recent CPU contention, as PSI's "some avg10" percentage.
+fn cpu_pressure() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/pressure/cpu").ok()?;
+    text.lines()
+        .find(|l| l.starts_with("some"))?
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("avg10="))?
+        .parse()
+        .ok()
 }
 
 /// Whether the kernel exposes multi-stage compression (CONFIG_ZRAM_MULTI_COMP).
@@ -448,6 +559,13 @@ struct ZramDevice {
     state: ZramDeviceState,
     /// Swapoff attempt count while in Draining state
     drain_attempts: u32,
+    /// Sectors written as of the last check, to measure new writes
+    last_sectors: u64,
+    /// Bytes written since the last sweep, whatever their age
+    pending_bytes: u64,
+    /// When the oldest of those writes happened, so we can tell whether any of
+    /// it has had time to become eligible
+    pending_since: Option<Instant>,
 }
 
 /// Aggregated statistics from all active ZRAM devices in the pool
@@ -468,10 +586,21 @@ pub struct ZramPoolStats {
 /// Configuration for the ZramPool
 #[derive(Debug, Clone)]
 pub struct ZramPoolConfig {
-    /// Maximum number of ZRAM devices (1-8)
+    /// Hard cap on device count, independent of what the sizes imply
     pub max_devices: u8,
-    /// Initial ZRAM size as percentage of RAM (first device)
-    pub initial_size_percent: u32,
+    /// Total disksize the pool may reach, as a percentage of RAM
+    pub total_size_percent: u32,
+    /// Size of each device, as a percentage of RAM. Together with
+    /// total_size_percent this sets how many devices the pool can hold.
+    pub device_size_percent: u32,
+    /// Devices created at startup; the rest are added only under pressure
+    pub initial_devices: u32,
+    /// Refuse to grow once zsmalloc holds this share of RAM
+    pub max_phys_percent: u8,
+    /// Minimum written since the last sweep before one is worth its cost
+    pub recomp_min_bytes: u64,
+    /// Defer sweeps above this CPU pressure, while RAM allows
+    pub recomp_max_cpu_pressure: f64,
     /// Main algorithm: where pages end up and spend most of their life
     pub algorithm: String,
     /// Level for the main algorithm (empty = kernel default)
@@ -511,11 +640,28 @@ impl ZramPoolConfig {
                 .get_as::<u8>("zram_max_devices")
                 .unwrap_or(defaults::ZRAM_MAX_DEVICES)
                 .clamp(1, 8),
-            initial_size_percent: config
-                .get_opt("zram_size")
-                .and_then(|s| s.strip_suffix('%'))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(50),
+            total_size_percent: percent_of_ram(config, "zram_size", defaults::ZRAM_SIZE),
+            device_size_percent: percent_of_ram(
+                config,
+                "zram_device_size",
+                defaults::ZRAM_DEVICE_SIZE,
+            ),
+            initial_devices: config
+                .get_as::<u32>("zram_initial_devices")
+                .unwrap_or(defaults::ZRAM_INITIAL_DEVICES)
+                .clamp(1, 8),
+            max_phys_percent: config
+                .get_as::<u8>("zram_max_phys_percent")
+                .unwrap_or(defaults::ZRAM_MAX_PHYS_PERCENT)
+                .clamp(10, 90),
+            recomp_min_bytes: config
+                .get_opt("zram_recomp_min_bytes")
+                .and_then(|s| parse_size(s).ok())
+                .unwrap_or(defaults::ZRAM_RECOMP_MIN_BYTES),
+            recomp_max_cpu_pressure: config
+                .get_as::<f64>("zram_recomp_max_cpu_pressure")
+                .unwrap_or(defaults::ZRAM_RECOMP_MAX_CPU_PRESSURE)
+                .clamp(0.0, 100.0),
             algorithm: config.get("zram_alg").unwrap_or(defaults::ZRAM_ALG).to_string(),
             algorithm_level: config
                 .get("zram_alg_level")
@@ -585,6 +731,8 @@ pub struct ZramPool {
     low_util_since: Option<Instant>,
     /// Round-robin position for promotion sweeps
     recomp_cursor: usize,
+    /// Consecutive sweeps skipped for CPU load
+    recomp_deferrals: u32,
 }
 
 impl ZramPool {
@@ -599,9 +747,10 @@ impl ZramPool {
 
         let mut pool_config = ZramPoolConfig::from_config(config);
 
-        // Enforce minimum initial_size_percent
-        if pool_config.initial_size_percent < 50 {
-            pool_config.initial_size_percent = 50;
+        // A pool smaller than a single device is a configuration that cannot
+        // be laid out; clamp rather than create a zero-sized device.
+        if pool_config.total_size_percent < pool_config.device_size_percent {
+            pool_config.total_size_percent = pool_config.device_size_percent;
         }
 
         makedirs(format!("{}/zram", WORK_DIR))?;
@@ -614,30 +763,45 @@ impl ZramPool {
             last_contraction: None,
             low_util_since: None,
             recomp_cursor: 0,
+            recomp_deferrals: 0,
         })
     }
 
-    /// Start the initial ZRAM devices (4 equal-sized devices for better distribution).
-    /// If existing devices are found (e.g., from a previous instance that wasn't
-    /// cleanly stopped), adopt them instead of creating new ones.
+    /// Start the initial ZRAM devices.
+    ///
+    /// Only zram_initial_devices are created here. The pool grows into its
+    /// ceiling under pressure rather than claiming it upfront, because the
+    /// entry table is allocated with the disksize whether or not it is ever
+    /// used, and the promotion sweep scales with it too.
+    ///
+    /// If existing devices are found (e.g., from a previous instance that
+    /// wasn't cleanly stopped), adopt them instead of creating new ones.
     pub fn start_primary(&mut self) -> Result<()> {
         crate::systemd::notify_status("Setting up ZramPool...");
 
-        let total_disksize = self.ram_total * self.config.initial_size_percent as u64 / 100;
+        let total_disksize = self.total_disksize();
         if total_disksize == 0 {
             warn!("ZramPool: calculated disksize is 0, skipping");
             return Ok(());
         }
 
-        const INITIAL_DEVICES: u32 = 4;
-        let per_device_size = total_disksize / INITIAL_DEVICES as u64;
+        let layout = self.layout();
+        let initial = self.config.initial_devices.min(layout.max_devices);
+
+        info!(
+            "ZramPool: ceiling {}MB across up to {} device(s) of {}MB, starting with {}",
+            total_disksize / (1024 * 1024),
+            layout.max_devices,
+            layout.device_size / (1024 * 1024),
+            initial
+        );
 
         // Try to adopt existing active zram swap devices first
         let adopted = self.adopt_existing_devices();
         if adopted > 0 {
             info!(
                 "ZramPool: adopted {} existing device(s), need {} total",
-                adopted, INITIAL_DEVICES
+                adopted, initial
             );
         }
 
@@ -647,17 +811,18 @@ impl ZramPool {
             info!("ZramPool: reclaimed {} orphaned device(s)", reclaimed);
         }
 
-        let remaining = (INITIAL_DEVICES as usize).saturating_sub(self.devices.len());
+        let remaining = (initial as usize).saturating_sub(self.devices.len());
         if remaining > 0 {
             info!(
-                "ZramPool: creating {} new device(s) ({}MB each, alg={}, max_devices={})",
-                remaining,
-                per_device_size / (1024 * 1024),
-                self.config.algorithm,
-                self.config.max_devices
+                "ZramPool: creating {} new device(s) (alg={}, max_devices={})",
+                remaining, self.config.algorithm, layout.max_devices
             );
             for _ in 0..remaining {
-                self.create_device(per_device_size)?;
+                let size = self.next_device_size();
+                if size == 0 {
+                    break; // Ceiling reached; nothing left to hand out.
+                }
+                self.create_device(size)?;
             }
         }
 
@@ -722,6 +887,11 @@ impl ZramPool {
                 unit_name,
                 state: ZramDeviceState::Active,
                 drain_attempts: 0,
+                last_sectors: 0,
+
+                pending_bytes: 0,
+
+                pending_since: None,
             };
             info!(
                 "ZramPool: adopted existing zram{} (disksize={}MB)",
@@ -732,6 +902,34 @@ impl ZramPool {
             adopted += 1;
         }
         adopted
+    }
+
+    /// Total disksize the pool may reach.
+    fn total_disksize(&self) -> u64 {
+        self.ram_total * self.config.total_size_percent as u64 / 100
+    }
+
+    /// Device count and per-device size implied by the configured sizes.
+    fn layout(&self) -> PoolLayout {
+        plan_pool(
+            self.total_disksize(),
+            self.ram_total * self.config.device_size_percent as u64 / 100,
+            self.config.max_devices as u32,
+        )
+    }
+
+    /// Size for the next device, or 0 when the ceiling is already used up.
+    ///
+    /// Sized against what the pool currently holds rather than a fixed share,
+    /// so the last device takes the remainder when the ceiling and the device
+    /// size do not divide evenly.
+    fn next_device_size(&self) -> u64 {
+        let total = self.total_disksize();
+        let allocated: u64 = self.devices.iter().map(|d| d.disksize).sum();
+        if allocated >= total {
+            return 0;
+        }
+        self.layout().device_size.min(total - allocated)
     }
 
     /// Release initialised zram devices that nothing is using.
@@ -891,6 +1089,9 @@ impl ZramPool {
             unit_name,
             state: ZramDeviceState::Active,
             drain_attempts: 0,
+            last_sectors: 0,
+            pending_bytes: 0,
+            pending_since: None,
         };
 
         info!(
@@ -913,6 +1114,53 @@ impl ZramPool {
     }
 
     /// Promote idle pages into the main algorithm on every active device.
+    /// Whether sweeping this device now is worth what the sweep costs.
+    ///
+    /// A sweep walks the whole entry table, about 8ms per GB of disksize
+    /// (measured), so it has to be justified by what it will find. Three
+    /// separate reasons not to run one:
+    ///
+    /// Nothing new. Pages become eligible by ageing, not by existing, so once
+    /// everything written has been promoted there is nothing to find until
+    /// something is written again. Writes are counted from the block layer
+    /// rather than from stored size, which a rewrite-in-place workload leaves
+    /// unchanged while replacing every page.
+    ///
+    /// Nothing yet. Data written moments ago cannot be idle. Sweeping for it
+    /// walks the table to promote nothing, so wait until the oldest pending
+    /// write has had time to age.
+    ///
+    /// Not now. Promotion has no deadline. When the CPU is contended and there
+    /// is RAM to spare, deferring costs some memory for a while and buys the
+    /// machine back its cycles. The deferral is capped, so a permanently busy
+    /// system still gets its pages promoted eventually rather than never.
+    fn sweep_verdict(&self, index: usize, stats: &ZramPoolStats) -> SweepVerdict {
+        let dev = &self.devices[index];
+
+        if dev.pending_bytes < self.config.recomp_min_bytes {
+            return SweepVerdict::TooLittle(dev.pending_bytes);
+        }
+
+        match dev.pending_since {
+            None => return SweepVerdict::TooLittle(0),
+            Some(since) if since.elapsed().as_secs() < self.config.recomp_idle_age => {
+                return SweepVerdict::TooYoung;
+            }
+            _ => {}
+        }
+
+        // Only trade memory for CPU while there is memory to trade. Past the
+        // comfort threshold the ratio is worth more than the cycles.
+        let comfortable = stats.phys_usage_percent < self.config.max_phys_percent / 2;
+        let busy = cpu_pressure().unwrap_or(0.0) >= self.config.recomp_max_cpu_pressure;
+
+        if busy && comfortable && self.recomp_deferrals < MAX_SWEEP_DEFERRALS {
+            return SweepVerdict::Defer;
+        }
+
+        SweepVerdict::Run
+    }
+
     /// Promote idle pages on one device, advancing the round-robin cursor.
     ///
     /// Sweeping one device per turn rather than all of them keeps each device's
@@ -920,7 +1168,7 @@ impl ZramPool {
     /// the size. The kernel recompresses every idle page in a single blocking
     /// write with no way to bound the work, so splitting across devices is the
     /// only way to chop that up.
-    fn recompress_next(&mut self) {
+    fn recompress_next(&mut self, stats: &ZramPoolStats) {
         let active: Vec<usize> = self
             .devices
             .iter()
@@ -936,18 +1184,55 @@ impl ZramPool {
         // The pool expands and contracts underneath this, so wrap against the
         // current active list rather than trusting the previous length.
         self.recomp_cursor = self.recomp_cursor.wrapping_add(1) % active.len();
-        let dev = &self.devices[active[self.recomp_cursor]];
+        let index = active[self.recomp_cursor];
+
+        // Account for writes before deciding, so a device that has been written
+        // to since the last look is known to have something worth finding.
+        let sysfs = self.devices[index].sysfs_path.clone();
+        if let Some(now_sectors) = sectors_written(&sysfs) {
+            let dev = &mut self.devices[index];
+            let new = now_sectors.saturating_sub(dev.last_sectors);
+            if new > 0 {
+                dev.last_sectors = now_sectors;
+                dev.pending_bytes = dev.pending_bytes.saturating_add(new * 512);
+                dev.pending_since.get_or_insert_with(Instant::now);
+            }
+        }
 
         // Devices adopted from a kernel without multi-stage compression have no
         // second rung to promote into.
-        if !recompression_supported(&dev.sysfs_path) {
+        if !recompression_supported(&sysfs) {
             return;
         }
 
+        let id = self.devices[index].id;
+        match self.sweep_verdict(index, stats) {
+            SweepVerdict::TooLittle(_) | SweepVerdict::TooYoung => return,
+            SweepVerdict::Defer => {
+                self.recomp_deferrals += 1;
+                debug!(
+                    "ZramPool: zram{} sweep deferred, CPU busy ({} of {} allowed)",
+                    id, self.recomp_deferrals, MAX_SWEEP_DEFERRALS
+                );
+                return;
+            }
+            SweepVerdict::Run => {}
+        }
+
+        self.recomp_deferrals = 0;
+        let promoted = self.devices[index].pending_bytes;
+        self.devices[index].pending_bytes = 0;
+        self.devices[index].pending_since = None;
+
+        debug!(
+            "ZramPool: zram{} sweeping, {}MB written since last",
+            id,
+            promoted / (1024 * 1024)
+        );
         recompress_device(
-            &dev.sysfs_path,
+            &sysfs,
             self.config.recomp_idle_age,
-            &format!("ZramPool: zram{}", dev.id),
+            &format!("ZramPool: zram{}", id),
         );
     }
 
@@ -1027,10 +1312,9 @@ impl ZramPool {
 
     /// Calculate disksize for the next device
     fn calculate_next_disksize(&self, _stats: &ZramPoolStats) -> u64 {
-        // Expansion devices use the same per-device size as initial ones
-        let total_disksize = self.ram_total * self.config.initial_size_percent as u64 / 100;
-        let min_size = self.ram_total * 5 / 100;
-        (total_disksize / 4).max(min_size)
+        // Growth uses the same rule as startup, so an expanded pool is laid out
+        // identically to one that started at that size.
+        self.next_device_size()
     }
     fn should_expand(&self, stats: &ZramPoolStats) -> bool {
         // 1. Not at device limit
@@ -1047,7 +1331,21 @@ impl ZramPool {
             return false;
         }
 
-        // 3. Pool utilization above threshold
+        // 3. Physical RAM already committed to zsmalloc.
+        //    Utilization is measured against disksize, which says nothing about
+        //    how much RAM the compressed data occupies: a full 150%-of-RAM pool
+        //    costs 75% of RAM at a 2x ratio and 40% at 3.78x. Growing on
+        //    utilization alone would keep adding capacity while the machine
+        //    runs out of the memory to store it in.
+        if stats.phys_usage_percent >= self.config.max_phys_percent {
+            warn!(
+                "ZramPool: zsmalloc holds {}% of RAM (limit {}%), not expanding",
+                stats.phys_usage_percent, self.config.max_phys_percent
+            );
+            return false;
+        }
+
+        // 4. Pool utilization above threshold
         if stats.utilization_percent < self.config.expand_threshold {
             return false;
         }
@@ -1116,8 +1414,9 @@ impl ZramPool {
 
     /// Check if pool should contract (remove last device)
     fn should_contract(&self, stats: &ZramPoolStats) -> bool {
-        // 1. Keep at least INITIAL_DEVICES (4) devices running at all times
-        if self.active_count() <= 4 {
+        // 1. Never shrink below the starting size. Was a literal 4 that
+        //    duplicated INITIAL_DEVICES and would not have followed it.
+        if self.active_count() <= self.config.initial_devices as usize {
             return false;
         }
 
@@ -1296,19 +1595,20 @@ impl ZramPool {
                 break;
             }
 
-            // Promotion runs on its own cadence, independent of the (much
-            // shorter) pool check interval.
-            if !self.config.initial_algorithm.is_empty()
-                && last_recompress.elapsed() >= Duration::from_secs(self.recompress_stride())
-            {
-                last_recompress = Instant::now();
-                self.recompress_next();
-            }
-
             let stats = match self.get_pool_stats() {
                 Some(s) => s,
                 None => continue,
             };
+
+            // Promotion runs on its own cadence, independent of the (much
+            // shorter) pool check interval. Needs the stats to decide whether
+            // there is RAM headroom to defer with.
+            if !self.config.initial_algorithm.is_empty()
+                && last_recompress.elapsed() >= Duration::from_secs(self.recompress_stride())
+            {
+                last_recompress = Instant::now();
+                self.recompress_next(&stats);
+            }
 
             // Periodic log (every ~30s)
             log_counter += 1;
@@ -1631,6 +1931,62 @@ Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority
         assert_eq!(pc.priority, defaults::ZRAM_PRIO);
     }
 
+    // ── Pool layout ──────────────────────────────────────────────────────────
+
+    const G: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn layout_divides_the_ceiling_into_nominal_devices() {
+        // 150% of 64G RAM = 96G ceiling, 25% = 16G devices -> 6
+        let l = plan_pool(96 * G, 16 * G, 8);
+        assert_eq!(l.max_devices, 6);
+        assert_eq!(l.device_size, 16 * G);
+    }
+
+    #[test]
+    fn layout_rounds_up_when_the_sizes_do_not_divide() {
+        // 100G ceiling in 30G devices needs 4, the last one carrying 10G
+        let l = plan_pool(100 * G, 30 * G, 8);
+        assert_eq!(l.max_devices, 4);
+        assert_eq!(l.device_size, 30 * G);
+        assert_eq!(device_size_at(100 * G, 30 * G, 3), 10 * G);
+    }
+
+    #[test]
+    fn layout_honours_the_ceiling_over_the_device_size() {
+        // 160G in 10G devices wants 16, more than the cap allows. The ceiling
+        // is what an admin sets deliberately, so the devices grow instead.
+        let l = plan_pool(160 * G, 10 * G, 8);
+        assert_eq!(l.max_devices, 8);
+        assert_eq!(l.device_size, 20 * G);
+        assert_eq!(l.max_devices as u64 * l.device_size, 160 * G);
+    }
+
+    #[test]
+    fn layout_survives_degenerate_input() {
+        assert_eq!(plan_pool(0, 16 * G, 8).max_devices, 1);
+        assert_eq!(plan_pool(16 * G, 0, 8).max_devices, 8); // no divide by zero
+        assert_eq!(plan_pool(16 * G, 16 * G, 0).max_devices, 1);
+    }
+
+    #[test]
+    fn device_sizes_never_exceed_the_ceiling() {
+        // The last device takes the remainder, and asking past the end gives 0
+        // so the caller stops rather than creating a zero-sized device.
+        let total = 100 * G;
+        let per = 30 * G;
+        let sizes: Vec<u64> = (0..6).map(|i| device_size_at(total, per, i)).collect();
+        assert_eq!(sizes, vec![30 * G, 30 * G, 30 * G, 10 * G, 0, 0]);
+        assert_eq!(sizes.iter().sum::<u64>(), total);
+    }
+
+    #[test]
+    fn device_sizes_are_exact_when_they_divide_evenly() {
+        let sizes: Vec<u64> = (0..6).map(|i| device_size_at(96 * G, 16 * G, i)).collect();
+        assert_eq!(sizes.iter().sum::<u64>(), 96 * G);
+        assert!(sizes.iter().all(|&s| s == 16 * G));
+    }
+
     // ── Compression rungs ────────────────────────────────────────────────────
 
     #[test]
@@ -1811,10 +2167,11 @@ Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority
     }
 
     #[test]
-    fn pool_config_initial_size_percent_raw() {
-        // from_config alone reports raw value; ZramPool::new enforces >=50.
+    fn pool_config_total_size_percent_raw() {
+        // from_config reports the raw value; ZramPool::new clamps it up to at
+        // least one device's worth.
         let cfg = cfg_from(&[("zram_size", "10%")]);
-        assert_eq!(ZramPoolConfig::from_config(&cfg).initial_size_percent, 10);
+        assert_eq!(ZramPoolConfig::from_config(&cfg).total_size_percent, 10);
     }
 
     #[test]

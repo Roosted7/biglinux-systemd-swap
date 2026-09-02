@@ -7,7 +7,35 @@
 
 // ── Zram ─────────────────────────────────────────────────────────────────────
 
-pub const ZRAM_SIZE: &str = "125%";
+// Total disksize the pool may reach. Was 125% here while autoconfig injected
+// 150%, so the documented default was never the one that ran; 150% is the
+// behaviour, so it is now also the default.
+pub const ZRAM_SIZE: &str = "150%";
+
+// Size of each device. The pool grows by adding devices of this size rather
+// than by enlarging them, which keeps the promotion sweep's per-device cost
+// flat: a sweep costs about 8ms per GB of disksize (measured), so a device
+// sized at a quarter of RAM is the same number of milliseconds to scan whether
+// the pool holds two of them or six.
+//
+// It also sets the ceiling on device count, as zram_size / zram_device_size.
+// At the defaults that is 150/25 = 6.
+pub const ZRAM_DEVICE_SIZE: &str = "25%";
+
+// Devices created at startup. The rest are added only if the pool fills.
+//
+// Starting small is what the sizing costs argue for: the entry table is
+// vzalloc'd upfront at 16 bytes per 4K page, so disksize costs 0.39% of itself
+// in RAM whether or not it is ever used, and the sweep cost scales with it too.
+// Two devices is a quarter of the table and a third of the sweep of the old
+// fixed four, and a pool that needs more will grow into them.
+pub const ZRAM_INITIAL_DEVICES: u32 = 2;
+
+// Refuse to grow once zsmalloc holds this share of RAM. Disksize utilization
+// does not measure the danger: filling a 150%-of-RAM pool costs 75% of RAM at
+// a 2x ratio and 40% at 3.78x, so the physical figure is the one that has to
+// be watched.
+pub const ZRAM_MAX_PHYS_PERCENT: u8 = 50;
 
 // Main algorithm: where pages end up and spend most of their life. Chosen for
 // compression ratio, since most of what sits in zram is cold.
@@ -49,6 +77,19 @@ pub const ZRAM_EXPAND_MIN_RATIO: f64 = 2.0;
 // sweep, and the burst is what a desktop notices. What it does cost is the
 // candidate scan, which walks the entry table in proportion to disksize rather
 // than to how much of the device is in use.
+// Minimum written since the last sweep before one is worth running. A sweep
+// walks the entry table at about 8ms per GB of disksize whatever it finds, so
+// scanning 23GB to promote a handful of pages is all cost and no benefit.
+// Promoting 64MB moves roughly 14MB out of RAM at the measured ratios, which
+// pays for a ~90ms scan; a few pages do not.
+pub const ZRAM_RECOMP_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+// Defer sweeps while PSI reports this share of the last ten seconds spent
+// waiting for CPU. Promotion has no deadline, so on a contended machine with
+// RAM to spare it is better to hold the memory a little longer and let the
+// work happen when there are cycles going spare.
+pub const ZRAM_RECOMP_MAX_CPU_PRESSURE: f64 = 20.0;
+
 pub const ZRAM_RECOMP_IDLE_AGE: u64 = 600;
 pub const ZRAM_RECOMP_INTERVAL: u64 = 60;
 

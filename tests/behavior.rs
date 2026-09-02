@@ -164,7 +164,7 @@ fn full_pipeline_zram_only_config() {
     let cfg = Config::from_file_for_tests(f.path()).unwrap();
     let pool = ZramPoolConfig::from_config(&cfg);
     assert_eq!(pool.algorithm, "lz4");
-    assert_eq!(pool.initial_size_percent, 100);
+    assert_eq!(pool.total_size_percent, 100);
     assert_eq!(pool.max_devices, 4);
 }
 
@@ -197,7 +197,7 @@ fn autoconfig_respects_user_override_full_flow() {
     assert_eq!(cfg.get("zram_alg").unwrap(), "zstd");
     // Flow continues into pool config with preserved override
     let pool = ZramPoolConfig::from_config(&cfg);
-    assert_eq!(pool.initial_size_percent, 250);
+    assert_eq!(pool.total_size_percent, 250);
 }
 
 #[test]
